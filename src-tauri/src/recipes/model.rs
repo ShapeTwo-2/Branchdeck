@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Variables every recipe can use without declaring them.
-pub const BUILTIN_VARS: [&str; 3] = ["current_branch", "default_branch", "repo_root"];
+/// `operation` is merge / rebase / cherry-pick / revert, or empty.
+pub const BUILTIN_VARS: [&str; 4] = ["current_branch", "default_branch", "repo_root", "operation"];
+/// Extra variables available to recipes with a `version:` block.
+pub const VERSION_VARS: [&str; 3] = ["version", "new_version", "version_files"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -20,8 +23,35 @@ pub struct RecipeDef {
     pub disabled: bool,
     #[serde(default)]
     pub inputs: Vec<InputDef>,
+    /// Conditions that must hold before the recipe can run.
+    #[serde(default)]
+    pub requires: Vec<RequireDef>,
+    pub version: Option<VersionDef>,
     #[serde(default)]
     pub steps: Vec<StepDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequireDef {
+    pub when: String,
+    pub message: String,
+}
+
+/// Turns on version bumping: `{{version}}`, `{{new_version}}`, `{{version_files}}`
+/// and the `update_version_files: true` step.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionDef {
+    /// Id of the input holding patch / minor / major (or an explicit X.Y.Z).
+    pub bump: String,
+    /// Manifests to update, relative to the repo root; missing ones are skipped.
+    #[serde(default = "default_version_files")]
+    pub files: Vec<String>,
+}
+
+fn default_version_files() -> Vec<String> {
+    super::version::DEFAULT_FILES.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,6 +67,8 @@ pub struct InputDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
     pub default: Option<serde_json::Value>,
+    /// Branch inputs only: true = must exist (locally or on origin), false = must not exist locally.
+    pub exists: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,47 +81,58 @@ pub enum InputKind {
     Bool,
 }
 
-/// A step is either a bare command string or `{ run, when, always }`.
+/// What a step does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// A command template.
+    Run(String),
+    /// Expands to one visible command per version file (needs a `version:` block).
+    UpdateVersionFiles,
+}
+
+/// A step is a bare command string, `{ run, when, always }`, or
+/// `{ update_version_files: true, when, always }`.
 #[derive(Debug, Clone)]
 pub struct StepDef {
-    pub run: String,
+    pub action: Action,
     pub when: Option<String>,
     pub always: bool,
 }
 
 impl<'de> Deserialize<'de> for StepDef {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Full {
-            run: String,
+            run: Option<String>,
+            #[serde(default)]
+            update_version_files: bool,
             when: Option<String>,
             #[serde(default)]
             always: bool,
         }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Either {
-            Plain(String),
-            Full(Full),
-        }
-        // Untagged errors are vague, so give a precise one for the common mistakes.
         let v = serde_yaml::Value::deserialize(d)?;
-        match serde_yaml::from_value::<Either>(v.clone()) {
-            Ok(Either::Plain(run)) => Ok(StepDef { run, when: None, always: false }),
-            Ok(Either::Full(f)) => Ok(StepDef { run: f.run, when: f.when, always: f.always }),
-            Err(_) => match v {
-                serde_yaml::Value::Mapping(ref m) if !m.contains_key("run") => Err(serde::de::Error::custom(format!(
-                    "step {:?} was read as `key: value` because it contains \": \". \
-                     Wrap the whole command in single quotes",
-                    m.keys().next().and_then(|k| k.as_str()).unwrap_or("?")
-                ))),
-                serde_yaml::Value::Mapping(_) => serde_yaml::from_value::<Full>(v)
-                    .map(|f| StepDef { run: f.run, when: f.when, always: f.always })
-                    .map_err(serde::de::Error::custom),
-                _ => Err(serde::de::Error::custom("a step must be a command string or { run, when, always }")),
-            },
+        let m = match v {
+            serde_yaml::Value::String(run) => return Ok(StepDef { action: Action::Run(run), when: None, always: false }),
+            serde_yaml::Value::Mapping(ref m) => m,
+            _ => return Err(D::Error::custom("a step must be a command string or { run, when, always }")),
+        };
+        // `- git commit -m "fix: x"` parses as a one-key map; say so instead of "unknown field".
+        if !m.contains_key("run") && !m.contains_key("update_version_files") {
+            return Err(D::Error::custom(format!(
+                "step {:?} was read as `key: value` because it contains \": \". \
+                 Wrap the whole command in single quotes",
+                m.keys().next().and_then(|k| k.as_str()).unwrap_or("?")
+            )));
         }
+        let f: Full = serde_yaml::from_value(v).map_err(D::Error::custom)?;
+        let action = match (f.run, f.update_version_files) {
+            (Some(run), false) => Action::Run(run),
+            (None, true) => Action::UpdateVersionFiles,
+            _ => return Err(D::Error::custom("a step needs either `run` or `update_version_files: true`, not both")),
+        };
+        Ok(StepDef { action, when: f.when, always: f.always })
     }
 }
 
@@ -157,9 +200,15 @@ impl Cond {
 
 #[derive(Debug, Clone)]
 pub struct Step {
-    pub run: String,
+    pub action: Action,
     pub when: Option<Cond>,
     pub always: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Requirement {
+    pub cond: Cond,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +218,8 @@ pub struct Recipe {
     pub description: Option<String>,
     pub confirm: bool,
     pub inputs: Vec<InputDef>,
+    pub requires: Vec<Requirement>,
+    pub version: Option<VersionDef>,
     pub steps: Vec<Step>,
     pub source: Source,
 }
@@ -220,31 +271,73 @@ impl RecipeDef {
             validate_input(input)?;
         }
 
+        if let Some(v) = &self.version {
+            if !self.inputs.iter().any(|i| i.id == v.bump) {
+                return Err(format!("version.bump refers to unknown input {:?}", v.bump));
+            }
+            if v.files.is_empty() {
+                return Err("version.files is empty".into());
+            }
+            known.extend(VERSION_VARS);
+        }
+
+        let parse_cond = |w: &str, at: &str| -> Result<Cond, String> {
+            let c = Cond::parse(w).map_err(|e| format!("{at}: {e}"))?;
+            if !known.contains(c.var()) {
+                return Err(format!("{at}: refers to unknown variable {:?}", c.var()));
+            }
+            Ok(c)
+        };
+
+        let requires = self
+            .requires
+            .iter()
+            .map(|r| Ok(Requirement { cond: parse_cond(&r.when, "requires")?, message: r.message.clone() }))
+            .collect::<Result<Vec<_>, String>>()?;
+
         let mut steps = Vec::with_capacity(self.steps.len());
         for (n, s) in self.steps.into_iter().enumerate() {
             let at = format!("step {}", n + 1);
-            if s.run.contains('\n') || s.run.contains('\r') {
-                return Err(format!("{at}: must be a single line"));
-            }
-            for p in template::placeholders(&s.run).map_err(|e| format!("{at}: {e}"))? {
-                if !known.contains(p.as_str()) {
-                    return Err(format!("{at}: unknown variable {{{{{p}}}}}"));
-                }
-            }
-            let when = match s.when.as_deref() {
-                Some(w) => {
-                    let c = Cond::parse(w).map_err(|e| format!("{at}: {e}"))?;
-                    if !known.contains(c.var()) {
-                        return Err(format!("{at}: when refers to unknown variable {:?}", c.var()));
+            match &s.action {
+                Action::Run(run) => {
+                    if run.contains('\n') || run.contains('\r') {
+                        return Err(format!("{at}: must be a single line"));
                     }
-                    Some(c)
+                    for p in template::placeholders(run).map_err(|e| format!("{at}: {e}"))? {
+                        if !known.contains(p.as_str()) {
+                            return Err(format!("{at}: unknown variable {{{{{p}}}}}"));
+                        }
+                    }
+                    // List variables may only appear unquoted.
+                    template::render(run, |name| {
+                        Ok(if name == "version_files" {
+                            template::Value::Words(vec![])
+                        } else {
+                            template::Value::Quoted(String::new())
+                        })
+                    })
+                    .map_err(|e| format!("{at}: {e}"))?;
                 }
-                None => None,
-            };
-            steps.push(Step { run: s.run, when, always: s.always });
+                Action::UpdateVersionFiles if self.version.is_none() => {
+                    return Err(format!("{at}: update_version_files needs a `version:` block on the recipe"));
+                }
+                Action::UpdateVersionFiles => {}
+            }
+            let when = s.when.as_deref().map(|w| parse_cond(w, &at)).transpose()?;
+            steps.push(Step { action: s.action, when, always: s.always });
         }
 
-        Ok(Recipe { id, name, description: self.description, confirm: self.confirm, inputs: self.inputs, steps, source })
+        Ok(Recipe {
+            id,
+            name,
+            description: self.description,
+            confirm: self.confirm,
+            inputs: self.inputs,
+            requires,
+            version: self.version,
+            steps,
+            source,
+        })
     }
 }
 
@@ -267,6 +360,9 @@ fn validate_input(input: &InputDef) -> Result<(), String> {
     }
     if input.kind != InputKind::Select && !input.options.is_empty() {
         return Err(format!("input {id:?}: options only apply to type: select"));
+    }
+    if input.kind != InputKind::Branch && input.exists.is_some() {
+        return Err(format!("input {id:?}: exists only applies to type: branch"));
     }
     Ok(())
 }

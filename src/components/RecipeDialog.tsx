@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { recipePlan, recipeRun } from "../lib/ipc";
+import { gitBranches, recipePlan, recipeRun } from "../lib/ipc";
 import type { InputDef, InputValues, Plan, Recipe } from "../lib/types";
 
 interface Props {
@@ -26,10 +26,17 @@ export function RecipeDialog({ recipe, onClose }: Props) {
   const [submitted, setSubmitted] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [branches, setBranches] = useState<string[]>([]);
   const firstField = useRef<HTMLInputElement | HTMLSelectElement | null>(null);
   const runButton = useRef<HTMLButtonElement>(null);
 
   const key = useMemo(() => JSON.stringify(values), [values]);
+
+  // Suggestions for "switch to an existing branch" style inputs.
+  const wantsBranches = recipe.inputs.some((i) => i.type === "branch" && i.exists !== false);
+  useEffect(() => {
+    if (wantsBranches) gitBranches().then(setBranches).catch(() => setBranches([]));
+  }, [wantsBranches]);
 
   // The backend renders the commands; refresh the preview as the user types.
   useEffect(() => {
@@ -153,6 +160,7 @@ export function RecipeDialog({ recipe, onClose }: Props) {
                   ) : (
                     <input
                       type="text"
+                      list={input.type === "branch" && input.exists !== false ? "bd-branches" : undefined}
                       spellCheck={input.type !== "branch"}
                       autoComplete="off"
                       placeholder={input.placeholder ?? ""}
@@ -193,7 +201,17 @@ export function RecipeDialog({ recipe, onClose }: Props) {
               {m}
             </div>
           ))}
+          {current?.warnings.map((w, i) => (
+            <div key={i} className="warning-box">
+              {w}
+            </div>
+          ))}
         </div>
+        <datalist id="bd-branches">
+          {branches.map((b) => (
+            <option key={b} value={b} />
+          ))}
+        </datalist>
 
         {runError && <div className="error-box">{runError}</div>}
         {confirming && (

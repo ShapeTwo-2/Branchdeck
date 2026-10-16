@@ -24,10 +24,37 @@ pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 /// Facts about the repo that recipes can reference as built-in variables.
 #[derive(Debug, Clone, Default)]
 pub struct RepoContext {
+    /// The terminal's directory.
+    pub cwd: Option<PathBuf>,
     pub root: Option<PathBuf>,
     /// None on a detached HEAD.
     pub current_branch: Option<String>,
     pub default_branch: Option<String>,
+    pub operation: Option<Operation>,
+}
+
+impl RepoContext {
+    /// True if the terminal is somewhere below the repo root rather than at it.
+    pub fn cwd_is_not_root(&self) -> bool {
+        match (&self.cwd, &self.root) {
+            (Some(cwd), Some(root)) => !same_path(cwd, root),
+            _ => false,
+        }
+    }
+}
+
+/// Compares paths from different sources (git prints C:/x, the shell may print C:\x).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    norm(a) == norm(b)
 }
 
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -35,10 +62,39 @@ pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 pub fn context(cwd: &Path) -> RepoContext {
-    let Some(root) = repo_root(cwd) else { return RepoContext::default() };
+    let Some(root) = repo_root(cwd) else {
+        return RepoContext { cwd: Some(cwd.to_path_buf()), ..Default::default() };
+    };
     let current_branch = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"]).filter(|b| !b.is_empty());
     let default_branch = default_branch(&root);
-    RepoContext { root: Some(root), current_branch, default_branch }
+    let operation = operation_in_progress(&root);
+    RepoContext { cwd: Some(cwd.to_path_buf()), root: Some(root), current_branch, default_branch, operation }
+}
+
+pub fn local_branch_exists(root: &Path, name: &str) -> bool {
+    git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")]).is_some()
+}
+
+pub fn remote_branch_exists(root: &Path, name: &str) -> bool {
+    git(root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{name}")]).is_some()
+}
+
+/// Local branches, then origin's branches that have no local counterpart.
+pub fn branch_names(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = git(root, &["branch", "--format=%(refname:short)"])
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default();
+    if let Some(remote) = git(root, &["branch", "-r", "--format=%(refname:short)"]) {
+        for r in remote.lines() {
+            if let Some(n) = r.strip_prefix("origin/") {
+                if n != "HEAD" && !names.iter().any(|x| x == n) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    names.retain(|n| !n.is_empty() && !n.starts_with('('));
+    names
 }
 
 /// origin/HEAD if the remote advertises it, else the first of main/master that exists locally.
@@ -62,6 +118,17 @@ pub enum Operation {
     Rebase,
     CherryPick,
     Revert,
+}
+
+impl Operation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Operation::Merge => "merge",
+            Operation::Rebase => "rebase",
+            Operation::CherryPick => "cherry-pick",
+            Operation::Revert => "revert",
+        }
+    }
 }
 
 pub fn operation_in_progress(cwd: &Path) -> Option<Operation> {

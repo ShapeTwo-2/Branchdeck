@@ -33,6 +33,10 @@ export function recipesList(): Promise<RecipeList> {
   return invoke<RecipeList>("recipes_list");
 }
 
+export function gitBranches(): Promise<string[]> {
+  return invoke<string[]>("git_branches");
+}
+
 export function recipePlan(id: string, values: InputValues): Promise<Plan> {
   return invoke<Plan>("recipe_plan", { id, values });
 }

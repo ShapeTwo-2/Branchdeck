@@ -5,6 +5,7 @@ pub mod loader;
 pub mod model;
 pub mod plan;
 pub mod template;
+pub mod version;
 
 use crate::git;
 use crate::pty::PtyState;
@@ -86,6 +87,13 @@ pub async fn recipe_plan(
     Ok(plan::plan(&recipe, &values, &ctx))
 }
 
+/// Branch names for autocomplete in branch inputs.
+#[tauri::command]
+pub async fn git_branches(state: State<'_, PtyState>) -> Result<Vec<String>, String> {
+    let root = state.cwd().as_deref().and_then(git::repo_root);
+    Ok(root.map(|r| git::branch_names(&r)).unwrap_or_default())
+}
+
 /// Re-renders the plan and runs it, but only if it still matches what the
 /// user saw in the preview (`expected`). Never runs anything unreviewed.
 #[tauri::command]
@@ -134,7 +142,7 @@ mod builtin_tests {
         let mut failed = false;
         let mut out = vec![];
         for s in p.steps {
-            if failed && !s.always {
+            if failed && (!s.always || git::operation_in_progress(&repo.work).is_some()) {
                 continue;
             }
             let o = std::process::Command::new(bash())
@@ -252,6 +260,67 @@ mod builtin_tests {
         assert!(all_ok(&res), "{res:?}");
         assert!(!r.work.join("wip.txt").exists());
         assert_eq!(git::git(&r.work, &["stash", "list"]).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn version_bump_updates_files_commits_tags_and_pushes() {
+        let r = TempRepo::new("bump");
+        let write = |rel: &str, body: &str| {
+            let p = r.work.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write("package.json", "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n");
+        write("src-tauri/Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n");
+        write("src-tauri/Cargo.lock", "[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n");
+        write("src-tauri/tauri.conf.json", "{\n  \"version\": \"0.1.0\"\n}\n");
+        write("unrelated.txt", "committed");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-q", "-m", "setup"]);
+        write("unrelated.txt", "dirty, must not be in the release commit");
+
+        let res = run(&r, "version-bump", &[("bump", json!("minor"))]);
+        assert!(all_ok(&res), "{res:?}");
+
+        let show = |args: &[&str]| git::git(&r.work, args).unwrap();
+        assert_eq!(show(&["log", "-1", "--format=%s"]), "chore: release v0.2.0");
+        let mut changed: Vec<_> = show(&["show", "--name-only", "--format="]).lines().map(String::from).collect();
+        changed.sort();
+        assert_eq!(changed, ["package.json", "src-tauri/Cargo.lock", "src-tauri/Cargo.toml", "src-tauri/tauri.conf.json"]);
+        assert_eq!(show(&["cat-file", "-t", "v0.2.0"]), "tag", "annotated tag");
+        assert!(git::git(&r.origin, &["rev-parse", "-q", "--verify", "refs/tags/v0.2.0"]).is_some(), "tag pushed");
+        assert_eq!(git::git(&r.origin, &["log", "-1", "--format=%s", "main"]).unwrap(), "chore: release v0.2.0");
+        for f in ["package.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json"] {
+            let body = std::fs::read_to_string(r.work.join(f)).unwrap();
+            assert!(body.contains("0.2.0") && !body.contains("0.1.0"), "{f}: {body}");
+        }
+        assert_eq!(show(&["status", "--porcelain"]), " M unrelated.txt");
+    }
+
+    #[test]
+    fn abort_go_back_after_failed_merge() {
+        let r = TempRepo::new("abort");
+        r.git(&["checkout", "-q", "-b", "dev"]);
+        commit_file(&r, "README.md", "dev version\n");
+        r.git(&["push", "-q", "-u", "origin", "dev"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.git(&["checkout", "-q", "-b", "feat/c"]);
+        commit_file(&r, "README.md", "feature version\n");
+
+        // Nothing in progress yet: the recipe refuses to plan.
+        let ctx = git::context(&r.work);
+        let recipe = loader::load(None).recipes.into_iter().find(|x| x.id == "abort-go-back").unwrap();
+        assert!(plan::plan(&recipe, &HashMap::new(), &ctx).errors[0].message.contains("Nothing to abort"));
+
+        let res = run(&r, "merge-into", &[("target", json!("dev"))]);
+        assert!(!all_ok(&res), "merge should conflict: {res:?}");
+        assert_eq!(git::operation_in_progress(&r.work), Some(git::Operation::Merge));
+        assert_eq!(head(&r), "dev", "always-step is skipped mid-merge");
+
+        let res = run(&r, "abort-go-back", &[]);
+        assert!(all_ok(&res), "{res:?}");
+        assert_eq!(git::operation_in_progress(&r.work), None);
+        assert_eq!(head(&r), "feat/c");
     }
 
     #[test]

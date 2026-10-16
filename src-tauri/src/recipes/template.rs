@@ -25,6 +25,9 @@ enum State {
 pub enum Value {
     /// Shell-quoted, safe.
     Quoted(String),
+    /// Several shell words, each quoted (e.g. a list of files). Only allowed
+    /// unquoted in the template.
+    Words(Vec<String>),
     /// Inserted verbatim. Only for previews of missing values, e.g. `<branch>`;
     /// never sent to the shell.
     Display(String),
@@ -58,6 +61,10 @@ pub fn render(
             if let Some((name, len)) = placeholder_at(rest) {
                 let text = match lookup(name)? {
                     Value::Quoted(v) => sh_quote(&v),
+                    Value::Words(_) if state == State::Double => {
+                        return Err(format!("{{{{{name}}}}} is a list of words; use it outside quotes"));
+                    }
+                    Value::Words(ws) => ws.iter().map(|w| sh_quote(w)).collect::<Vec<_>>().join(" "),
                     Value::Display(v) => v,
                 };
                 i += len;
@@ -177,6 +184,16 @@ mod tests {
         assert_eq!(r(r#"echo \"{{m}}"#, &[("m", "x")]).unwrap(), r#"echo \"'x'"#);
         assert_eq!(r(r#"echo "a\"{{m}}""#, &[("m", "x")]).unwrap(), r#"echo "a\""'x'"#);
         assert!(r(r#"echo "open"#, &[]).is_err());
+    }
+
+    #[test]
+    fn word_lists() {
+        let words = |n: &str| match n {
+            "files" => Ok(Value::Words(vec!["a b".into(), "c".into()])),
+            _ => Ok(Value::Quoted("x".into())),
+        };
+        assert_eq!(render("git add -- {{files}}", words).unwrap(), "git add -- 'a b' 'c'");
+        assert!(render(r#"echo "{{files}}""#, words).is_err());
     }
 
     #[test]

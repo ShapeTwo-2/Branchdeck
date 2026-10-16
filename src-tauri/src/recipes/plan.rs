@@ -1,9 +1,10 @@
 //! Turns a recipe plus form values into the exact commands that will be typed.
 //! The frontend only ever displays what this produces.
 
-use super::model::{InputKind, Recipe};
-use super::template::{self, Value};
-use crate::git::RepoContext;
+use super::model::{Action, InputKind, Recipe};
+use super::template::{self, sh_quote, Value};
+use super::version;
+use crate::git::{self, RepoContext};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -29,31 +30,54 @@ pub struct Plan {
     pub steps: Vec<PlannedStep>,
     /// Empty means the plan can run.
     pub errors: Vec<FieldError>,
+    /// Worth knowing, but not blocking.
+    pub warnings: Vec<String>,
+}
+
+enum Var {
+    Text(String),
+    Words(Vec<String>),
+    /// Not available; the string is what the preview shows instead.
+    Missing(String),
+}
+
+impl Var {
+    /// The value `when:` / `requires:` conditions compare against.
+    fn as_cond_value(&self) -> &str {
+        match self {
+            Var::Text(s) => s,
+            Var::Words(w) if w.is_empty() => "",
+            Var::Words(_) => "true",
+            Var::Missing(_) => "",
+        }
+    }
+}
+
+fn opt_var(v: &Option<String>, what: &str) -> Var {
+    match v {
+        Some(s) => Var::Text(s.clone()),
+        None => Var::Missing(format!("<{what}>")),
+    }
 }
 
 pub fn plan(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &RepoContext) -> Plan {
     let mut errors = Vec::new();
-    // name -> Ok(text) if usable, Err(display placeholder) if not.
-    let mut vars: HashMap<&str, Result<String, String>> = HashMap::new();
+    let mut warnings = Vec::new();
+    let mut vars: HashMap<&str, Var> = HashMap::new();
+    let error = |input: Option<&str>, message: String| FieldError { input: input.map(String::from), message };
 
     if ctx.root.is_none() {
-        errors.push(FieldError {
-            input: None,
-            message: "The terminal is not inside a git repository. cd into one first.".into(),
-        });
+        errors.push(error(None, "The terminal is not inside a git repository. cd into one first.".into()));
     }
-    let builtin = |v: &Option<String>, what: &str| v.clone().ok_or_else(|| format!("<{what}>"));
-    vars.insert("current_branch", builtin(&ctx.current_branch, "current branch"));
-    vars.insert("default_branch", builtin(&ctx.default_branch, "default branch"));
-    vars.insert(
-        "repo_root",
-        ctx.root.as_ref().map(|p| p.display().to_string()).ok_or_else(|| "<repo root>".into()),
-    );
+    vars.insert("current_branch", opt_var(&ctx.current_branch, "current branch"));
+    vars.insert("default_branch", opt_var(&ctx.default_branch, "default branch"));
+    vars.insert("repo_root", opt_var(&ctx.root.as_ref().map(|p| p.display().to_string()), "repo root"));
+    vars.insert("operation", Var::Text(ctx.operation.map(|o| o.as_str()).unwrap_or("").into()));
 
     for input in &recipe.inputs {
         let label = input.label.clone().unwrap_or_else(|| input.id.clone());
         let given = raw.get(&input.id).filter(|v| !v.is_null()).or(input.default.as_ref());
-        let value = match input.kind {
+        let mut value = match input.kind {
             InputKind::Bool => Ok(given.and_then(|v| v.as_bool()).unwrap_or(false).to_string()),
             _ => {
                 let text = given.and_then(|v| v.as_str()).unwrap_or("");
@@ -61,31 +85,98 @@ pub fn plan(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &Rep
                 check_text(input.kind, text, input.required, &input.options)
             }
         };
+        if let (Ok(name), Some(want), Some(root)) = (&value, input.exists, &ctx.root) {
+            if !name.is_empty() {
+                let local = git::local_branch_exists(root, name);
+                if want && !local && !git::remote_branch_exists(root, name) {
+                    value = Err(format!("No branch named {name:?} (locally or on origin)"));
+                } else if !want && local {
+                    value = Err(format!("Branch {name:?} already exists"));
+                }
+            }
+        }
         match value {
             Ok(v) => {
-                vars.insert(&input.id, Ok(v));
+                vars.insert(&input.id, Var::Text(v));
             }
             Err(message) => {
-                errors.push(FieldError { input: Some(input.id.clone()), message });
-                vars.insert(&input.id, Err(format!("<{label}>")));
+                errors.push(error(Some(&input.id), message));
+                vars.insert(&input.id, Var::Missing(format!("<{label}>")));
             }
         }
     }
 
+    if ctx.root.is_some() {
+        for r in &recipe.requires {
+            let v = vars.get(r.cond.var()).map(Var::as_cond_value).unwrap_or("");
+            if !r.cond.eval(v) {
+                errors.push(error(None, r.message.clone()));
+            }
+        }
+    }
+
+    // Version bump: computed from the manifests, expanded into visible commands.
+    let mut bump_commands = Vec::new();
+    if let Some(vdef) = &recipe.version {
+        let set_missing =|vars: &mut HashMap<&str, Var>| {
+            vars.insert("version", Var::Missing("<version>".into()));
+            vars.insert("new_version", Var::Missing("<new version>".into()));
+            vars.insert("version_files", Var::Missing("<version files>".into()));
+        };
+        match (&ctx.root, vars.get(vdef.bump.as_str())) {
+            (Some(root), Some(Var::Text(how))) => match version::plan_bump(root, &vdef.files, how) {
+                Ok(b) => {
+                    vars.insert("version", Var::Text(b.current.to_string()));
+                    vars.insert("new_version", Var::Text(b.new.to_string()));
+                    vars.insert("version_files", Var::Words(b.files));
+                    bump_commands = b.commands;
+                    warnings.extend(b.warnings);
+                }
+                Err(e) => {
+                    errors.push(error(Some(&vdef.bump), e));
+                    set_missing(&mut vars);
+                }
+            },
+            _ => set_missing(&mut vars),
+        }
+    }
+
     let mut steps = Vec::new();
+    // Version files are repo-relative; run from the root if the terminal is in a subfolder.
+    if recipe.version.is_some() && ctx.cwd_is_not_root() {
+        if let Some(root) = &ctx.root {
+            let root = root.to_string_lossy().replace('\\', "/");
+            steps.push(PlannedStep { command: format!("cd {}", sh_quote(&root)), always: false });
+        }
+    }
+
     let mut needs_branch = false;
     let mut used_display = false;
     for step in &recipe.steps {
         if let Some(cond) = &step.when {
             // A condition on a value the user hasn't filled in yet counts as false.
-            let v = vars.get(cond.var()).and_then(|v| v.as_ref().ok()).map(String::as_str).unwrap_or("");
+            let v = vars.get(cond.var()).map(Var::as_cond_value).unwrap_or("");
             if !cond.eval(v) {
                 continue;
             }
         }
-        let rendered = template::render(&step.run, |name| match vars.get(name) {
-            Some(Ok(v)) => Ok(Value::Quoted(v.clone())),
-            Some(Err(display)) => {
+        let run = match &step.action {
+            Action::UpdateVersionFiles => {
+                steps.extend(bump_commands.iter().map(|c| PlannedStep { command: c.clone(), always: step.always }));
+                continue;
+            }
+            Action::Run(run) => run,
+        };
+        // Steps that operate on an empty file list (tag-only projects) have nothing to do.
+        if matches!(vars.get("version_files"), Some(Var::Words(w)) if w.is_empty())
+            && template::placeholders(run).is_ok_and(|p| p.iter().any(|n| n == "version_files"))
+        {
+            continue;
+        }
+        let rendered = template::render(run, |name| match vars.get(name) {
+            Some(Var::Text(v)) => Ok(Value::Quoted(v.clone())),
+            Some(Var::Words(w)) => Ok(Value::Words(w.clone())),
+            Some(Var::Missing(display)) => {
                 used_display = true;
                 if name == "current_branch" {
                     needs_branch = true;
@@ -97,27 +188,23 @@ pub fn plan(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &Rep
         match rendered {
             Ok(command) => steps.push(PlannedStep { command, always: step.always }),
             // Validated at load time; only reachable if that check is bypassed.
-            Err(e) => errors.push(FieldError { input: None, message: e }),
+            Err(e) => errors.push(error(None, e)),
         }
     }
     if needs_branch && ctx.root.is_some() {
-        errors.push(FieldError {
-            input: None,
-            message: "HEAD is detached; this recipe needs you to be on a branch.".into(),
-        });
+        errors.push(error(None, "HEAD is detached; this recipe needs you to be on a branch.".into()));
     }
-    if ctx.root.is_some() && ctx.default_branch.is_none() && recipe.steps.iter().any(|s| s.run.contains("default_branch")) {
-        errors.push(FieldError {
-            input: None,
-            message: "Could not find the default branch (no origin/HEAD, main or master).".into(),
-        });
+    let uses_default = recipe.steps.iter().any(|s| matches!(&s.action, Action::Run(r) if r.contains("default_branch")));
+    if ctx.root.is_some() && ctx.default_branch.is_none() && uses_default {
+        errors.push(error(None, "Could not find the default branch (no origin/HEAD, main or master).".into()));
     }
     // Invariant: a `<placeholder>` is only for display and must never be typed.
     if used_display && errors.is_empty() {
-        errors.push(FieldError { input: None, message: "Some values are missing.".into() });
+        errors.push(error(None, "Some values are missing.".into()));
     }
-    Plan { steps, errors }
+    Plan { steps, errors, warnings }
 }
+
 
 /// Ok(value) or Err(message). Optional fields may be empty.
 fn check_text(kind: InputKind, text: &str, required: bool, options: &[String]) -> Result<String, String> {
@@ -172,6 +259,7 @@ mod tests {
             root: Some(PathBuf::from("/repo")),
             current_branch: Some("feature/a".into()),
             default_branch: Some("main".into()),
+            ..Default::default()
         }
     }
 
@@ -251,6 +339,61 @@ steps:
         let detached = RepoContext { current_branch: None, ..ctx() };
         let p = plan(&r, &vals(&[]), &detached);
         assert!(p.errors[0].message.contains("detached"));
+    }
+
+    #[test]
+    fn requires_blocks_with_its_message() {
+        let r = recipe(
+            "name: abort\nrequires:\n  - { when: operation, message: Nothing to abort }\nsteps:\n  - git merge --abort",
+        );
+        let p = plan(&r, &vals(&[]), &ctx());
+        assert_eq!(p.errors[0].message, "Nothing to abort");
+        let merging = RepoContext { operation: Some(crate::git::Operation::Merge), ..ctx() };
+        assert!(plan(&r, &vals(&[]), &merging).errors.is_empty());
+    }
+
+    #[test]
+    fn branch_existence_checks() {
+        let repo = crate::git::testutil::TempRepo::new("exists");
+        repo.git(&["branch", "taken"]);
+        let r = recipe(
+            "name: x\ninputs:\n  - { id: new, type: branch, exists: false }\n  - { id: old, type: branch, exists: true }\nsteps:\n  - git switch -c {{new}} {{old}}",
+        );
+        let c = crate::git::context(&repo.work);
+        let p = plan(&r, &vals(&[("new", json!("fresh")), ("old", json!("taken"))]), &c);
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let p = plan(&r, &vals(&[("new", json!("taken")), ("old", json!("ghost"))]), &c);
+        let msgs: Vec<_> = p.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(msgs[0].contains("already exists") && msgs[1].contains("No branch"), "{msgs:?}");
+    }
+
+    #[test]
+    fn version_bump_plan_from_subfolder() {
+        let repo = crate::git::testutil::TempRepo::new("bumpplan");
+        std::fs::create_dir_all(repo.work.join("sub")).unwrap();
+        std::fs::write(repo.work.join("Cargo.toml"), "[package]\nname = \"a\"\nversion = \"0.4.2\"\n").unwrap();
+        std::fs::write(repo.work.join("sub/keep.txt"), "x").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "c"]);
+        let r = recipe(
+            r#"
+name: bump
+inputs: [{ id: bump, type: select, options: [patch, minor, major], default: patch }]
+version: { bump: bump }
+steps:
+  - update_version_files: true
+  - git add -- {{version_files}}
+  - 'git commit -m "chore: release v{{new_version}}" -- {{version_files}}'
+  - git tag -a "v{{new_version}}" -m "v{{new_version}}"
+"#,
+        );
+        let c = crate::git::context(&repo.work.join("sub"));
+        let p = plan(&r, &vals(&[("bump", json!("minor"))]), &c);
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let cmds: Vec<_> = p.steps.iter().map(|s| s.command.as_str()).collect();
+        assert!(cmds[0].starts_with("cd '"), "{cmds:?}");
+        assert!(cmds[1].starts_with("perl ") && cmds[1].ends_with("'Cargo.toml'"));
+        assert_eq!(&cmds[2..], ["git add -- 'Cargo.toml'", r#"git commit -m "chore: release v"'0.5.0' -- 'Cargo.toml'"#, r#"git tag -a "v"'0.5.0' -m "v"'0.5.0'"#]);
     }
 
     #[test]

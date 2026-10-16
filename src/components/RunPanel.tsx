@@ -82,8 +82,9 @@ export function RunPanel({ run, onDismiss }: Props) {
       {done?.message && <div className="run-message">{done.message}</div>}
       {done?.operation && (
         <div className="run-message warn">
-          Git is in the middle of a {done.operation}. Resolve the conflicts in the terminal and continue, or run{" "}
-          <code>git {done.operation} --abort</code>. (One-click Resolve / Abort buttons come with the safety milestone.)
+          Git is in the middle of a {done.operation}. Resolve the conflicts in the terminal and continue, or use
+          the <strong>Abort merge/rebase &amp; go back</strong> recipe. (One-click Resolve / Abort buttons here come
+          with the safety milestone.)
         </div>
       )}
     </section>

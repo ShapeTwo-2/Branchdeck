@@ -19,6 +19,7 @@ pub fn run() {
             recipes::recipes_list,
             recipes::recipe_plan,
             recipes::recipe_run,
+            recipes::git_branches,
             runner::recipe_cancel,
         ])
         .build(tauri::generate_context!())

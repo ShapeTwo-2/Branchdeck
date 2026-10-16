@@ -30,6 +30,8 @@ export interface InputDef {
   type: InputKind;
   options?: string[];
   default: string | boolean | null;
+  /** Branch inputs: true = must exist, false = must be new. */
+  exists: boolean | null;
 }
 
 export type RecipeSource = "builtin" | "global" | "repo";
@@ -71,6 +73,7 @@ export interface FieldError {
 export interface Plan {
   steps: PlannedStep[];
   errors: FieldError[];
+  warnings: string[];
 }
 
 export type StepState = "pending" | "running" | "ok" | "failed" | "skipped";

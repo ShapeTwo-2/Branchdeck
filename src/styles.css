@@ -404,6 +404,12 @@ pre {
   color: #e06c75;
 }
 
+.warning-box {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--accent);
+}
+
 .confirm-box {
   padding: 10px 12px;
   border-radius: 6px;

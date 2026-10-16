@@ -1,0 +1,86 @@
+:root {
+  --bg: #14161b;
+  --panel: #1b1e24;
+  --panel-border: #2a2e37;
+  --text: #d7dae0;
+  --muted: #7f8794;
+  --accent: #e5c07b;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.app {
+  display: flex;
+  height: 100%;
+}
+
+.sidebar {
+  width: 260px;
+  flex: 0 0 260px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--panel-border);
+  user-select: none;
+}
+
+.sidebar-brand {
+  padding: 12px 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.sidebar-section {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.recipes {
+  flex: 1;
+  overflow-y: auto;
+  border-bottom: none;
+}
+
+.section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  padding: 8px 0 0 10px;
+  background: var(--bg);
+}
+
+.terminal-host {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}

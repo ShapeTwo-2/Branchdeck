@@ -22,7 +22,9 @@ export function RecipeDialog({ recipe, onClose }: Props) {
   const [plan, setPlan] = useState<{ key: string; plan: Plan } | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
-  const [touched, setTouched] = useState<Set<string>>(new Set());
+  // Fields the user has typed in. Errors on those show live; "Required" waits for Run,
+  // so moving focus away (to Cancel, or another window) never pops up errors.
+  const [edited, setEdited] = useState<Set<string>>(new Set());
   const [submitted, setSubmitted] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -85,6 +87,7 @@ export function RecipeDialog({ recipe, onClose }: Props) {
 
   const set = (id: string, v: string | boolean) => {
     setValues((old) => ({ ...old, [id]: v }));
+    setEdited((s) => (s.has(id) ? s : new Set(s).add(id)));
     setConfirming(false);
     setRunError(null);
   };
@@ -127,9 +130,9 @@ export function RecipeDialog({ recipe, onClose }: Props) {
             {recipe.inputs.map((input, idx) => {
               const label = input.label ?? input.id;
               const err = fieldErrors.get(input.id);
-              const showErr = err && (submitted || touched.has(input.id));
+              const hasText = String(values[input.id] ?? "").trim() !== "";
+              const showErr = err && (submitted || (edited.has(input.id) && hasText));
               const refProp = idx === 0 ? { ref: firstField as React.Ref<never> } : {};
-              const blur = () => setTouched((t) => new Set(t).add(input.id));
               if (input.type === "bool") {
                 return (
                   <label key={input.id} className="field field-bool">
@@ -166,7 +169,6 @@ export function RecipeDialog({ recipe, onClose }: Props) {
                       placeholder={input.placeholder ?? ""}
                       value={String(values[input.id] ?? "")}
                       onChange={(e) => set(input.id, e.target.value)}
-                      onBlur={blur}
                       className={showErr ? "invalid" : ""}
                       {...refProp}
                     />

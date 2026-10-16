@@ -10,6 +10,7 @@ interface Props {
   onRefresh: () => void;
   onOpen: (recipe: Recipe) => void;
   onAdd: () => void;
+  onReviewTrust: () => void;
 }
 
 function basename(path: string) {
@@ -18,7 +19,7 @@ function basename(path: string) {
 
 const SOURCE_LABEL = { builtin: null, global: "global", repo: "repo" } as const;
 
-export function Sidebar({ statusBar, list, listError, disabledReason, onRefresh, onOpen, onAdd }: Props) {
+export function Sidebar({ statusBar, list, listError, disabledReason, onRefresh, onOpen, onAdd, onReviewTrust }: Props) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">Branchdeck</div>
@@ -31,6 +32,18 @@ export function Sidebar({ statusBar, list, listError, disabledReason, onRefresh,
           </button>
         </div>
         {disabledReason && <div className="hint">{disabledReason}</div>}
+        {list?.pendingTrust && (
+          <div className="trust-banner">
+            <span>
+              {list.pendingTrust.changed
+                ? "This repo's team recipes changed."
+                : "This repo has team recipes (.branchdeck.yml)."}
+            </span>
+            <button className="btn btn-small" onClick={onReviewTrust}>
+              Review
+            </button>
+          </div>
+        )}
         <div className="recipe-list">
           {list?.recipes.map((r) => (
             <button

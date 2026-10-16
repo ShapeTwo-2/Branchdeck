@@ -7,6 +7,8 @@ interface Props {
   onClose: () => void;
 }
 
+type DirtyChoice = "stash" | "continue";
+
 function initialValues(inputs: InputDef[]): InputValues {
   const v: InputValues = {};
   for (const i of inputs) {
@@ -17,8 +19,22 @@ function initialValues(inputs: InputDef[]): InputValues {
   return v;
 }
 
+const STATUS_LABEL: Record<string, string> = {
+  M: "modified",
+  A: "added",
+  D: "deleted",
+  R: "renamed",
+  C: "copied",
+  T: "type changed",
+  U: "conflicted",
+  "??": "new",
+};
+
 export function RecipeDialog({ recipe, onClose }: Props) {
   const [values, setValues] = useState<InputValues>(() => initialValues(recipe.inputs));
+  // Files picked for `git add -A`; null until the first plan offers a picker.
+  const [staged, setStaged] = useState<string[] | null>(null);
+  const [dirtyChoice, setDirtyChoice] = useState<DirtyChoice>("stash");
   const [plan, setPlan] = useState<{ key: string; plan: Plan } | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
@@ -32,7 +48,10 @@ export function RecipeDialog({ recipe, onClose }: Props) {
   const firstField = useRef<HTMLInputElement | HTMLSelectElement | null>(null);
   const runButton = useRef<HTMLButtonElement>(null);
 
-  const key = useMemo(() => JSON.stringify(values), [values]);
+  // Only stash when the plan actually reports a dirty switch.
+  const dirtyKnown = !!plan?.plan.dirtySwitch;
+  const stashFirst = dirtyKnown && dirtyChoice === "stash";
+  const key = useMemo(() => JSON.stringify({ values, staged, stashFirst }), [values, staged, stashFirst]);
 
   // Suggestions for "switch to an existing branch" style inputs.
   const wantsBranches = recipe.inputs.some((i) => i.type === "branch" && i.exists !== false);
@@ -44,11 +63,14 @@ export function RecipeDialog({ recipe, onClose }: Props) {
   useEffect(() => {
     let cancelled = false;
     const t = setTimeout(() => {
-      recipePlan(recipe.id, values)
+      recipePlan(recipe.id, values, { staged, stashFirst })
         .then((p) => {
-          if (!cancelled) {
-            setPlan({ key, plan: p });
-            setPlanError(null);
+          if (cancelled) return;
+          setPlan({ key, plan: p });
+          setPlanError(null);
+          // First time the picker appears: start from the suggested files.
+          if (p.staging && staged === null) {
+            setStaged(p.staging.files.filter((f) => f.suggested).map((f) => f.path));
           }
         })
         .catch((e) => !cancelled && setPlanError(String(e)));
@@ -57,7 +79,7 @@ export function RecipeDialog({ recipe, onClose }: Props) {
       cancelled = true;
       clearTimeout(t);
     };
-    // `key` stands in for `values` (same content, stable identity).
+    // `key` stands in for values/staged/stashFirst (same content, stable identity).
   }, [recipe.id, key]);
 
   useEffect(() => {
@@ -77,26 +99,43 @@ export function RecipeDialog({ recipe, onClose }: Props) {
   }, [confirming, onClose]);
 
   const current = plan?.key === key ? plan.plan : null;
+  const shown = current ?? plan?.plan ?? null;
   const fieldErrors = new Map<string, string>();
   const generalErrors: string[] = [];
   for (const e of current?.errors ?? []) {
     if (e.input) fieldErrors.set(e.input, e.message);
     else generalErrors.push(e.message);
   }
+  const risks = current?.risks ?? [];
+  const riskySteps = new Map<number, string[]>();
+  for (const r of risks) riskySteps.set(r.step, [...(riskySteps.get(r.step) ?? []), r.message]);
+  const needsConfirm = recipe.confirm || risks.length > 0;
   const canRun = !!current && current.errors.length === 0 && current.steps.length > 0 && !starting;
+
+  const resetConfirm = () => {
+    setConfirming(false);
+    setRunError(null);
+  };
 
   const set = (id: string, v: string | boolean) => {
     setValues((old) => ({ ...old, [id]: v }));
     setEdited((s) => (s.has(id) ? s : new Set(s).add(id)));
-    setConfirming(false);
-    setRunError(null);
+    resetConfirm();
+  };
+
+  const toggleFile = (path: string, on: boolean) => {
+    setStaged((s) => {
+      const cur = s ?? [];
+      return on ? [...cur, path] : cur.filter((p) => p !== path);
+    });
+    resetConfirm();
   };
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
     setSubmitted(true);
     if (!canRun || !current) return;
-    if (recipe.confirm && !confirming) {
+    if (needsConfirm && !confirming) {
       setConfirming(true);
       runButton.current?.focus();
       return;
@@ -107,6 +146,12 @@ export function RecipeDialog({ recipe, onClose }: Props) {
         recipe.id,
         values,
         current.steps.map((s) => s.command),
+        {
+          staged,
+          stashFirst,
+          allowDirtySwitch: dirtyKnown && dirtyChoice === "continue",
+          confirmed: confirming,
+        },
       );
       onClose();
     } catch (err) {
@@ -116,6 +161,9 @@ export function RecipeDialog({ recipe, onClose }: Props) {
       setStarting(false);
     }
   };
+
+  const staging = shown?.staging;
+  const dirty = shown?.dirtySwitch;
 
   return (
     <div className="dialog-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -180,6 +228,73 @@ export function RecipeDialog({ recipe, onClose }: Props) {
           </div>
         )}
 
+        {dirty && (
+          <fieldset className="choice-box">
+            <legend>
+              You have {dirty.changed} uncommitted change{dirty.changed === 1 ? "" : "s"} and this recipe switches
+              branches
+            </legend>
+            <label>
+              <input
+                type="radio"
+                name="dirty"
+                checked={dirtyChoice === "stash"}
+                onChange={() => {
+                  setDirtyChoice("stash");
+                  resetConfirm();
+                }}
+              />
+              <span>
+                Stash them first <span className="muted">(recommended; get them back with git stash pop)</span>
+              </span>
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="dirty"
+                checked={dirtyChoice === "continue"}
+                onChange={() => {
+                  setDirtyChoice("continue");
+                  resetConfirm();
+                }}
+              />
+              <span>
+                Continue anyway <span className="muted">(they come along to the other branch, or the switch fails)</span>
+              </span>
+            </label>
+          </fieldset>
+        )}
+
+        {staging && staged && (
+          <fieldset className="choice-box staging">
+            <legend>
+              Files to commit ({staged.length} of {staging.files.length})
+              <span className="legend-actions">
+                <button type="button" className="link-btn" onClick={() => setStaged(staging.files.map((f) => f.path))}>
+                  all
+                </button>
+                <button type="button" className="link-btn" onClick={() => setStaged([])}>
+                  none
+                </button>
+              </span>
+            </legend>
+            <div className="file-list-box">
+              {staging.files.map((f) => (
+                <label key={f.path} className={`stage-file${f.reason ? " flagged" : ""}`} title={f.reason ?? undefined}>
+                  <input
+                    type="checkbox"
+                    checked={staged.includes(f.path)}
+                    onChange={(e) => toggleFile(f.path, e.target.checked)}
+                  />
+                  <code className="stage-path">{f.path}</code>
+                  <span className={`stage-code code-${f.code === "??" ? "new" : f.code}`}>{STATUS_LABEL[f.code] ?? f.code}</span>
+                  {f.reason && <span className="stage-reason">⚠ {f.reason}</span>}
+                </label>
+              ))}
+            </div>
+          </fieldset>
+        )}
+
         <div className="preview">
           <div className="preview-title">
             Commands that will be typed into the terminal
@@ -187,16 +302,24 @@ export function RecipeDialog({ recipe, onClose }: Props) {
           </div>
           {planError && <div className="error-box">{planError}</div>}
           <ol className="preview-steps">
-            {(current ?? plan?.plan)?.steps.map((s, i) => (
-              <li key={i} className={current ? "" : "stale"}>
-                <code>{s.command}</code>
-                {s.always && (
-                  <span className="tag" title="Runs even if an earlier step fails">
-                    always
-                  </span>
-                )}
-              </li>
-            ))}
+            {shown?.steps.map((s, i) => {
+              const r = current ? riskySteps.get(i) : undefined;
+              return (
+                <li key={i} className={`${current ? "" : "stale"}${r ? " risky" : ""}`}>
+                  <code>{s.command}</code>
+                  {s.always && (
+                    <span className="tag" title="Runs even if an earlier step fails">
+                      always
+                    </span>
+                  )}
+                  {r && (
+                    <span className="tag tag-risk" title={r.join("\n")}>
+                      ⚠ needs confirmation
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ol>
           {generalErrors.map((m, i) => (
             <div key={i} className="error-box">
@@ -217,8 +340,22 @@ export function RecipeDialog({ recipe, onClose }: Props) {
 
         {runError && <div className="error-box">{runError}</div>}
         {confirming && (
-          <div className="confirm-box">
-            This recipe asks for confirmation. Run the {current?.steps.length} commands above?
+          <div className="confirm-box" role="alert">
+            {risks.length > 0 ? (
+              <>
+                <strong>Please confirm:</strong>
+                <ul>
+                  {risks.map((r, i) => (
+                    <li key={i}>
+                      Step {r.step + 1}: {r.message}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <>This recipe asks for confirmation.</>
+            )}{" "}
+            Run the {current?.steps.length} commands above?
           </div>
         )}
 
@@ -233,7 +370,7 @@ export function RecipeDialog({ recipe, onClose }: Props) {
             className={`btn btn-primary${confirming ? " btn-danger" : ""}`}
             disabled={!canRun && submitted}
           >
-            {starting ? "Starting…" : confirming ? "Yes, run it" : "Run"}
+            {starting ? "Starting…" : confirming ? "Yes, run it" : needsConfirm ? "Review & run…" : "Run"}
           </button>
         </footer>
       </form>

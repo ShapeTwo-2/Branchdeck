@@ -49,7 +49,7 @@ pub struct ShellStatus {
 pub struct Shared {
     session: Option<Session>,
     pub shell: ShellStatus,
-    pub run: Option<runner::Run>,
+    pub runner: runner::RunnerState,
 }
 
 impl Shared {
@@ -62,8 +62,8 @@ impl Shared {
     }
 
     /// Borrows the parts the runner needs at the same time.
-    pub fn split(&mut self) -> (&mut ShellStatus, &mut Option<runner::Run>, SessionWriter<'_>) {
-        (&mut self.shell, &mut self.run, SessionWriter(&mut self.session))
+    pub fn split(&mut self) -> (&mut ShellStatus, &mut runner::RunnerState, SessionWriter<'_>) {
+        (&mut self.shell, &mut self.runner, SessionWriter(&mut self.session))
     }
 }
 
@@ -87,7 +87,7 @@ impl PtyState {
     pub fn shutdown(&self) {
         let mut s = self.shared.lock().unwrap();
         s.session.take();
-        s.run = None;
+        s.runner = runner::RunnerState::default();
         s.shell = ShellStatus::default();
     }
 
@@ -192,7 +192,7 @@ pub async fn pty_spawn(
         let mut s = state.shared.lock().unwrap();
         s.session = Some(Session { generation, master: pair.master, writer, killer });
         s.shell = ShellStatus { integration: launch.integration, ready: false, idle: false, cwd: Some(cwd.clone()) };
-        s.run = None;
+        s.runner = runner::RunnerState::default();
     }
 
     let shared = state.shared.clone();
@@ -231,7 +231,7 @@ pub async fn pty_spawn(
             if s.session.as_ref().map(|x| x.generation) == Some(generation) {
                 s.session.take();
                 s.shell = ShellStatus::default();
-                (true, s.run.take().is_some())
+                (true, s.runner.run.take().is_some())
             } else {
                 (false, false)
             }
@@ -262,7 +262,7 @@ pub async fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), S
         s.shell.idle = false;
     }
     if data.contains('\x03') {
-        if let Some(run) = s.run.as_mut() {
+        if let Some(run) = s.runner.run.as_mut() {
             run.cancel_requested = true;
         }
     }

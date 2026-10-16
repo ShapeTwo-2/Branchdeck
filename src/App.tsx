@@ -5,6 +5,7 @@ import { RecipeDialog } from "./components/RecipeDialog";
 import { RunPanel, type RunView } from "./components/RunPanel";
 import { AddRecipeDialog } from "./components/AddRecipeDialog";
 import { StatusBar } from "./components/StatusBar";
+import { TrustDialog } from "./components/TrustDialog";
 import {
   gitInfo,
   onGitStatus,
@@ -29,6 +30,7 @@ export default function App() {
   const [run, setRun] = useState<RunView | null>(null);
   const [openRecipe, setOpenRecipe] = useState<Recipe | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [trustOpen, setTrustOpen] = useState(false);
   const cwdRef = useRef<string | null>(null);
   const focusTerminal = useRef<() => void>(() => {});
 
@@ -117,6 +119,7 @@ export default function App() {
   const closeDialog = () => {
     setOpenRecipe(null);
     setAddOpen(false);
+    setTrustOpen(false);
     focusTerminal.current();
   };
 
@@ -130,9 +133,10 @@ export default function App() {
         onRefresh={refresh}
         onOpen={setOpenRecipe}
         onAdd={() => setAddOpen(true)}
+        onReviewTrust={() => setTrustOpen(true)}
       />
       <main className="main">
-        {run && <RunPanel run={run} onDismiss={dismissRun} />}
+        {run && <RunPanel run={run} status={status} onDismiss={dismissRun} />}
         {listening && (
           <Terminal
             onSpawned={(info) => {
@@ -145,6 +149,16 @@ export default function App() {
         )}
       </main>
       {openRecipe && <RecipeDialog key={openRecipe.id} recipe={openRecipe} onClose={closeDialog} />}
+      {trustOpen && list?.pendingTrust && (
+        <TrustDialog
+          pending={list.pendingTrust}
+          onClose={closeDialog}
+          onTrusted={() => {
+            closeDialog();
+            refresh();
+          }}
+        />
+      )}
       {addOpen && <AddRecipeDialog globalFile={list?.globalFile ?? null} repoRoot={list?.repoRoot ?? null} onClose={closeDialog} />}
     </div>
   );

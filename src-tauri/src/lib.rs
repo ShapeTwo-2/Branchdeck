@@ -4,6 +4,7 @@ mod osc;
 mod pty;
 mod recipes;
 mod runner;
+mod safety;
 mod shell;
 mod status;
 
@@ -23,6 +24,10 @@ pub fn run() {
             recipes::recipe_run,
             recipes::git_branches,
             runner::recipe_cancel,
+            runner::conflict_files,
+            runner::conflict_continue,
+            runner::conflict_abort,
+            recipes::repo_trust,
             git::git_info,
             status::status_refresh,
         ])

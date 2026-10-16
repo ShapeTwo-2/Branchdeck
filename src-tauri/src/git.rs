@@ -118,6 +118,63 @@ pub struct RepoContext {
     pub current_branch: Option<String>,
     pub default_branch: Option<String>,
     pub operation: Option<Operation>,
+    pub git_dir: Option<PathBuf>,
+    /// Uncommitted changes, from `git status`.
+    pub changes: Vec<ChangedFile>,
+    /// Branch patterns that need confirmation before pushing (filled in by the caller).
+    pub protected: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedFile {
+    /// Relative to the repo root, forward slashes. Untracked directories end in `/`.
+    pub path: String,
+    /// Short status, e.g. "M", "A", "D", "R", "??", "U".
+    pub code: String,
+    pub tracked: bool,
+}
+
+/// Uncommitted changes in the repo (staged, unstaged, untracked; ignored files excluded).
+pub fn changed_files(root: &Path) -> Vec<ChangedFile> {
+    let Some(out) = git_raw(root, &["--no-optional-locks", "status", "--porcelain=v2", "-z"]) else { return vec![] };
+    let mut files = vec![];
+    let mut fields = out.split(|b| *b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+    while let Some(line) = fields.next() {
+        let kind = line.chars().next();
+        match kind {
+            Some('1') | Some('2') | Some('u') => {
+                // Path is the last space-separated field (paths may contain spaces, so count fields).
+                let n = match kind {
+                    Some('1') => 8,
+                    Some('2') => 9,
+                    _ => 10,
+                };
+                let path = line.splitn(n + 1, ' ').nth(n).unwrap_or("").to_string();
+                let xy: Vec<char> = line.chars().skip(2).take(2).collect();
+                let code = if kind == Some('u') {
+                    "U".to_string()
+                } else {
+                    let c = if xy.first() != Some(&'.') { xy[0] } else { *xy.get(1).unwrap_or(&'M') };
+                    c.to_string()
+                };
+                if kind == Some('2') {
+                    fields.next(); // original path of a rename
+                }
+                files.push(ChangedFile { path, code, tracked: true });
+            }
+            Some('?') => files.push(ChangedFile { path: line[2..].to_string(), code: "??".into(), tracked: false }),
+            _ => {}
+        }
+    }
+    files
+}
+
+/// Files with unresolved conflicts.
+pub fn conflicted_files(root: &Path) -> Vec<String> {
+    git(root, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 impl RepoContext {
@@ -155,7 +212,18 @@ pub fn context(cwd: &Path) -> RepoContext {
     let current_branch = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"]).filter(|b| !b.is_empty());
     let default_branch = default_branch(&root);
     let operation = operation_in_progress(&root);
-    RepoContext { cwd: Some(cwd.to_path_buf()), root: Some(root), current_branch, default_branch, operation }
+    let git_dir = git(&root, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from);
+    let changes = changed_files(&root);
+    RepoContext {
+        cwd: Some(cwd.to_path_buf()),
+        root: Some(root),
+        current_branch,
+        default_branch,
+        operation,
+        git_dir,
+        changes,
+        protected: vec![],
+    }
 }
 
 pub fn local_branch_exists(root: &Path, name: &str) -> bool {
@@ -308,6 +376,24 @@ mod tests {
         assert_eq!(ctx.current_branch.as_deref(), Some("feature/x"));
         assert_eq!(ctx.default_branch.as_deref(), Some("main"));
         assert!(ctx.root.is_some());
+    }
+
+    #[test]
+    fn lists_changed_files() {
+        let r = TempRepo::new("changes");
+        std::fs::write(r.work.join("README.md"), "edited\n").unwrap();
+        std::fs::write(r.work.join("new file.txt"), "x").unwrap();
+        std::fs::create_dir_all(r.work.join("dist")).unwrap();
+        std::fs::write(r.work.join("dist/app.js"), "x").unwrap();
+        std::fs::write(r.work.join("staged.txt"), "x").unwrap();
+        r.git(&["add", "staged.txt"]);
+        let mut files = changed_files(&r.work);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.code.as_str(), f.tracked)).collect();
+        assert_eq!(
+            got,
+            vec![("README.md", "M", true), ("dist/", "??", false), ("new file.txt", "??", false), ("staged.txt", "A", true)]
+        );
     }
 
     #[test]

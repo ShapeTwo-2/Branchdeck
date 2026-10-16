@@ -5,10 +5,12 @@ pub mod loader;
 pub mod model;
 pub mod plan;
 pub mod template;
+pub mod trust;
 pub mod version;
 
 use crate::git;
 use crate::pty::PtyState;
+use crate::runner::RunMeta;
 use model::{InputDef, Recipe, Source};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -47,14 +49,17 @@ pub struct RecipeList {
     recipes: Vec<RecipeView>,
     errors: Vec<loader::LoadError>,
     global_file: Option<PathBuf>,
+    /// The repo's .branchdeck.yml, if it hasn't been trusted in its current form.
+    pending_trust: Option<loader::PendingTrust>,
 }
 
 fn find(cwd: Option<&Path>, id: &str) -> Result<(Recipe, git::RepoContext), String> {
     if git::install().is_none() {
         return Err(format!("Git was not found. {}", git::install_hint()));
     }
-    let ctx = cwd.map(git::context).unwrap_or_default();
+    let mut ctx = cwd.map(git::context).unwrap_or_default();
     let loaded = loader::load(ctx.root.as_deref());
+    ctx.protected = loaded.protected.unwrap_or_default();
     let recipe = loaded
         .recipes
         .into_iter()
@@ -75,7 +80,20 @@ pub async fn recipes_list(state: State<'_, PtyState>) -> Result<RecipeList, Stri
         recipes: loaded.recipes.iter().map(RecipeView::from).collect(),
         errors: loaded.errors,
         global_file: loader::global_file(),
+        pending_trust: loaded.pending_trust,
     })
+}
+
+/// Trusts the repo's .branchdeck.yml, but only if it still has the content
+/// (hash) the user just reviewed.
+#[tauri::command]
+pub async fn repo_trust(state: State<'_, PtyState>, hash: String) -> Result<(), String> {
+    let root = state.cwd().as_deref().and_then(git::repo_root).ok_or("Not inside a git repository.")?;
+    let text = std::fs::read_to_string(root.join(loader::REPO_FILE)).map_err(|e| e.to_string())?;
+    if trust::hash(&text) != hash {
+        return Err(format!("{} changed while you were reviewing it. Review it again.", loader::REPO_FILE));
+    }
+    trust::TrustStore::user().ok_or("No home directory to save trust in.")?.trust(&root, &hash)
 }
 
 /// Renders the commands for a preview. Always succeeds unless the recipe is gone;
@@ -85,9 +103,12 @@ pub async fn recipe_plan(
     state: State<'_, PtyState>,
     id: String,
     values: HashMap<String, serde_json::Value>,
+    staged: Option<Vec<String>>,
+    stash_first: Option<bool>,
 ) -> Result<plan::Plan, String> {
     let (recipe, ctx) = find(state.cwd().as_deref(), &id)?;
-    Ok(plan::plan(&recipe, &values, &ctx))
+    let extras = plan::Extras { staged, stash_first: stash_first.unwrap_or(false) };
+    Ok(plan::plan_with(&recipe, &values, &ctx, &extras))
 }
 
 /// Branch names for autocomplete in branch inputs.
@@ -95,6 +116,22 @@ pub async fn recipe_plan(
 pub async fn git_branches(state: State<'_, PtyState>) -> Result<Vec<String>, String> {
     let root = state.cwd().as_deref().and_then(git::repo_root);
     Ok(root.map(|r| git::branch_names(&r)).unwrap_or_default())
+}
+
+/// The user's answers in the dialog, checked again here so the frontend
+/// can't skip a confirmation.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChoices {
+    staged: Option<Vec<String>>,
+    #[serde(default)]
+    stash_first: bool,
+    /// "Continue anyway" for switching branches with uncommitted changes.
+    #[serde(default)]
+    allow_dirty_switch: bool,
+    /// Confirmed risky steps / a `confirm: true` recipe.
+    #[serde(default)]
+    confirmed: bool,
 }
 
 /// Re-renders the plan and runs it, but only if it still matches what the
@@ -106,17 +143,30 @@ pub async fn recipe_run(
     id: String,
     values: HashMap<String, serde_json::Value>,
     expected: Vec<String>,
+    choices: Option<RunChoices>,
 ) -> Result<(), String> {
+    let choices = choices.unwrap_or_default();
     let (recipe, ctx) = find(state.cwd().as_deref(), &id)?;
-    let p = plan::plan(&recipe, &values, &ctx);
+    let extras = plan::Extras { staged: choices.staged, stash_first: choices.stash_first };
+    let p = plan::plan_with(&recipe, &values, &ctx, &extras);
     if let Some(e) = p.errors.first() {
         return Err(e.message.clone());
     }
     let commands: Vec<&str> = p.steps.iter().map(|s| s.command.as_str()).collect();
     if commands != expected.iter().map(String::as_str).collect::<Vec<_>>() {
-        return Err("The commands changed since the preview (branch or recipe file changed). Review them again.".into());
+        return Err("The commands changed since the preview (branch, files or recipe changed). Review them again.".into());
     }
-    crate::runner::start_in_app(&app, &state, recipe.name.clone(), p.steps)
+    if p.dirty_switch.is_some() && !choices.stash_first && !choices.allow_dirty_switch {
+        return Err("You have uncommitted changes. Choose \"Stash first\" or \"Continue anyway\".".into());
+    }
+    if (recipe.confirm || !p.risks.is_empty()) && !choices.confirmed {
+        return Err("This recipe needs confirmation before it runs.".into());
+    }
+    if let Some((path, contents)) = &p.pathspec_file {
+        std::fs::write(path, contents).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    }
+    let meta = RunMeta { name: recipe.name.clone(), start_branch: ctx.current_branch.clone() };
+    crate::runner::start_in_app(&app, &state, meta, p.steps)
 }
 
 /// Runs every built-in recipe's real commands with bash in throwaway repos
@@ -324,6 +374,42 @@ mod builtin_tests {
         assert!(all_ok(&res), "{res:?}");
         assert_eq!(git::operation_in_progress(&r.work), None);
         assert_eq!(head(&r), "feat/c");
+    }
+
+    /// Resolve → Continue: finish the merge with the runner's continue command,
+    /// then the rest of Merge into… (push, go back) completes.
+    #[test]
+    fn resolve_and_continue_after_conflict() {
+        let r = TempRepo::new("continue");
+        r.git(&["checkout", "-q", "-b", "dev"]);
+        commit_file(&r, "README.md", "dev version\n");
+        r.git(&["push", "-q", "-u", "origin", "dev"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.git(&["checkout", "-q", "-b", "feat/r"]);
+        commit_file(&r, "README.md", "feature version\n");
+
+        let ctx = git::context(&r.work);
+        let recipe = loader::load(None).recipes.into_iter().find(|x| x.id == "merge-into").unwrap();
+        let steps = plan::plan(&recipe, &HashMap::from([("target".to_string(), json!("dev"))]), &ctx).steps;
+        let res = run(&r, "merge-into", &[("target", json!("dev"))]);
+        let failed = res.iter().position(|(_, c)| *c != 0).unwrap();
+        assert_eq!(git::operation_in_progress(&r.work), Some(git::Operation::Merge));
+        assert_eq!(git::conflicted_files(&r.work), vec!["README.md"]);
+
+        // The user resolves and stages.
+        std::fs::write(r.work.join("README.md"), "both\n").unwrap();
+        r.git(&["add", "README.md"]);
+        assert!(git::conflicted_files(&r.work).is_empty());
+
+        let mut cont = vec![crate::runner::continue_command(git::Operation::Merge).to_string()];
+        cont.extend(steps[failed + 1..].iter().map(|s| s.command.clone()));
+        for c in &cont {
+            let ok = std::process::Command::new(bash()).args(["--norc", "-c", c]).current_dir(&r.work).status().unwrap();
+            assert!(ok.success(), "{c}");
+        }
+        assert_eq!(git::operation_in_progress(&r.work), None);
+        assert_eq!(head(&r), "feat/r");
+        assert_eq!(git::git(&r.origin, &["show", "dev:README.md"]).unwrap(), "both");
     }
 
     #[test]

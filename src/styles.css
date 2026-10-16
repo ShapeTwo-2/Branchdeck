@@ -496,6 +496,153 @@ pre {
   color: #e06c75;
 }
 
+.dialog-wide {
+  width: min(760px, 100%);
+}
+
+.choice-box {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.choice-box legend {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--accent);
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.choice-box > label {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  cursor: pointer;
+}
+
+.legend-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  color: #61afef;
+  font: inherit;
+  font-size: 12px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.file-list-box {
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stage-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.stage-path {
+  word-break: break-all;
+}
+
+.stage-file.flagged .stage-path {
+  color: var(--accent);
+}
+
+.stage-code {
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.stage-reason {
+  font-size: 11px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.preview-steps li.risky code {
+  color: #ef7b84;
+}
+
+.tag-risk {
+  color: #1b1e24;
+  background: #e06c75;
+}
+
+.confirm-box ul {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.trust-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(97, 175, 239, 0.4);
+  background: rgba(97, 175, 239, 0.08);
+}
+
+.trust-content {
+  max-height: 50vh;
+  overflow: auto;
+  color: var(--text);
+}
+
+.conflict-box {
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: rgba(229, 192, 123, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conflict-title {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.conflict-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.resolve-help p {
+  margin: 0 0 6px;
+}
+
+.conflict-files {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+
 .warning-box {
   margin-top: 8px;
   font-size: 12px;

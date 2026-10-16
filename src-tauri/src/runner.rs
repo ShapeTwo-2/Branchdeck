@@ -3,12 +3,17 @@
 //! A step is typed only when the shell is at a prompt. The next prompt marker
 //! carries that step's exit code: 0 moves on to the next step; anything else
 //! stops the recipe, after which only `always: true` steps still run (and not
-//! even those while git is mid-merge/rebase; the conflict UI handles that).
+//! even those while git is mid-merge/rebase).
+//!
+//! A recipe stopped by a merge/rebase conflict is kept as "suspended": the
+//! conflict UI can continue it (finish the operation, then the remaining
+//! steps) or abort it and return to the branch the recipe started on.
 
 use crate::git::{self, Operation};
 use crate::osc::Prompt;
 use crate::pty::{PtyState, Shared, ShellStatus};
 use crate::recipes::plan::PlannedStep;
+use crate::recipes::template::sh_quote;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,12 +36,35 @@ pub enum StepState {
 
 #[derive(Debug)]
 pub struct Run {
+    name: String,
+    start_branch: Option<String>,
     steps: Vec<PlannedStep>,
     states: Vec<StepState>,
     current: usize,
     failure: Option<(usize, i32)>,
     /// Set when the user presses Ctrl+C (or clicks Stop) during a run.
     pub cancel_requested: bool,
+}
+
+/// A recipe stopped by a conflict, waiting for Resolve → Continue or Abort.
+#[derive(Debug, Clone)]
+pub struct Suspended {
+    pub name: String,
+    pub remaining: Vec<PlannedStep>,
+    pub start_branch: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct RunnerState {
+    pub run: Option<Run>,
+    pub suspended: Option<Suspended>,
+}
+
+/// Name and starting point of a run.
+pub struct RunMeta {
+    pub name: String,
+    /// The branch checked out when the recipe started, for "go back".
+    pub start_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +106,10 @@ pub struct RunDone {
     pub exit_code: Option<i32>,
     /// A merge/rebase/... left waiting for the user.
     pub operation: Option<Operation>,
+    /// Steps that will run after Resolve → Continue.
+    pub remaining: usize,
+    /// Where Abort & go back returns to.
+    pub start_branch: Option<String>,
     pub message: Option<String>,
 }
 
@@ -108,6 +140,8 @@ pub fn emit_shell_exited(app: &AppHandle) {
             failed_step: None,
             exit_code: None,
             operation: None,
+            remaining: 0,
+            start_branch: None,
             message: Some("The shell exited while the recipe was running.".into()),
         })],
     );
@@ -127,15 +161,15 @@ fn type_step(run: &mut Run, shell: &mut ShellStatus, sink: &mut dyn Sink, index:
 /// Starts a run. Refuses unless the shell is integrated, at a prompt and not already running one.
 pub fn start(
     shell: &mut ShellStatus,
-    run_slot: &mut Option<Run>,
+    state: &mut RunnerState,
     sink: &mut dyn Sink,
-    name: String,
+    meta: RunMeta,
     steps: Vec<PlannedStep>,
 ) -> Result<Vec<Event>, String> {
     if !shell.integration {
         return Err("Recipes need bash or zsh with Branchdeck's shell integration (see ~/.branchdeck/config.yml).".into());
     }
-    if run_slot.is_some() {
+    if state.run.is_some() {
         return Err("A recipe is already running.".into());
     }
     if !shell.ready || !shell.idle {
@@ -145,32 +179,30 @@ pub fn start(
         return Err("Nothing to run.".into());
     }
     let mut run = Run {
+        name: meta.name,
+        start_branch: meta.start_branch,
         states: vec![StepState::Pending; steps.len()],
         steps,
         current: 0,
         failure: None,
         cancel_requested: false,
     };
-    let mut events = vec![Event::Started(RunStarted { name, steps: run.steps.clone() })];
+    let mut events = vec![Event::Started(RunStarted { name: run.name.clone(), steps: run.steps.clone() })];
     events.push(type_step(&mut run, shell, sink, 0)?);
-    *run_slot = Some(run);
+    state.run = Some(run);
+    state.suspended = None;
     Ok(events)
 }
 
 /// Handles a prompt marker: the shell is idle again, and if a step was running it just finished.
-pub fn handle_prompt(
-    shell: &mut ShellStatus,
-    run_slot: &mut Option<Run>,
-    sink: &mut dyn Sink,
-    prompt: Prompt,
-) -> Vec<Event> {
+pub fn handle_prompt(shell: &mut ShellStatus, state: &mut RunnerState, sink: &mut dyn Sink, prompt: Prompt) -> Vec<Event> {
     shell.ready = true;
     shell.idle = true;
     if !prompt.cwd.is_empty() {
         shell.cwd = Some(PathBuf::from(&prompt.cwd));
     }
     let mut events = vec![Event::Prompt(PromptEvent { exit_code: prompt.exit_code, cwd: prompt.cwd })];
-    let Some(run) = run_slot.as_mut() else { return events };
+    let Some(run) = state.run.as_mut() else { return events };
 
     let idx = run.current;
     let code = prompt.exit_code;
@@ -216,12 +248,7 @@ pub fn handle_prompt(
             Err(e) => {
                 run.failure.get_or_insert((next, -1));
                 run.states[next] = StepState::Failed;
-                events.push(Event::Step(StepEvent {
-                    index: next,
-                    state: StepState::Failed,
-                    exit_code: None,
-                    note: Some(e),
-                }));
+                events.push(Event::Step(StepEvent { index: next, state: StepState::Failed, exit_code: None, note: Some(e) }));
                 break;
             }
         }
@@ -242,14 +269,25 @@ pub fn handle_prompt(
     } else {
         cwd.as_deref().and_then(git::operation_in_progress)
     };
+    let run = state.run.take().unwrap();
+    let mut remaining = 0;
+    state.suspended = match (status, operation, run.failure) {
+        (RunStatus::Failed, Some(_), Some((failed, _))) => {
+            let rest = run.steps[failed + 1..].to_vec();
+            remaining = rest.len();
+            Some(Suspended { name: run.name.clone(), remaining: rest, start_branch: run.start_branch.clone() })
+        }
+        _ => None,
+    };
     events.push(Event::Done(RunDone {
         status,
         failed_step: run.failure.map(|f| f.0),
         exit_code: run.failure.map(|f| f.1),
         operation,
+        remaining,
+        start_branch: run.start_branch,
         message: None,
     }));
-    *run_slot = None;
     events
 }
 
@@ -260,8 +298,8 @@ pub fn on_prompt(app: &AppHandle, shared: &Arc<Mutex<Shared>>, generation: u64, 
         if s.generation() != Some(generation) {
             return;
         }
-        let (shell, run, mut sink) = s.split();
-        let events = handle_prompt(shell, run, &mut sink, prompt);
+        let (shell, runner, mut sink) = s.split();
+        let events = handle_prompt(shell, runner, &mut sink, prompt);
         (events, shell.cwd.clone())
     };
     emit(app, events);
@@ -271,11 +309,11 @@ pub fn on_prompt(app: &AppHandle, shared: &Arc<Mutex<Shared>>, generation: u64, 
     }
 }
 
-pub fn start_in_app(app: &AppHandle, state: &State<'_, PtyState>, name: String, steps: Vec<PlannedStep>) -> Result<(), String> {
+pub fn start_in_app(app: &AppHandle, state: &State<'_, PtyState>, meta: RunMeta, steps: Vec<PlannedStep>) -> Result<(), String> {
     let events = {
         let mut s = state.shared.lock().unwrap();
-        let (shell, run, mut sink) = s.split();
-        start(shell, run, &mut sink, name, steps)?
+        let (shell, runner, mut sink) = s.split();
+        start(shell, runner, &mut sink, meta, steps)?
     };
     emit(app, events);
     Ok(())
@@ -285,9 +323,86 @@ pub fn start_in_app(app: &AppHandle, state: &State<'_, PtyState>, name: String, 
 #[tauri::command]
 pub async fn recipe_cancel(state: State<'_, PtyState>) -> Result<(), String> {
     let mut s = state.shared.lock().unwrap();
-    let Some(run) = s.run.as_mut() else { return Ok(()) };
+    let Some(run) = s.runner.run.as_mut() else { return Ok(()) };
     run.cancel_requested = true;
     s.write(b"\x03")
+}
+
+fn repo_root(state: &State<'_, PtyState>) -> Result<PathBuf, String> {
+    state
+        .cwd()
+        .as_deref()
+        .and_then(git::repo_root)
+        .ok_or_else(|| "The terminal is not inside a git repository.".into())
+}
+
+/// The command that finishes an operation once its conflicts are resolved.
+/// GIT_EDITOR=true accepts the prepared message instead of opening an editor.
+pub fn continue_command(op: Operation) -> &'static str {
+    match op {
+        Operation::Merge => "git commit --no-edit",
+        Operation::Rebase => "GIT_EDITOR=true git rebase --continue",
+        Operation::CherryPick => "GIT_EDITOR=true git cherry-pick --continue",
+        Operation::Revert => "GIT_EDITOR=true git revert --continue",
+    }
+}
+
+/// Steps for Abort & go back.
+pub fn abort_steps(op: Operation, start_branch: Option<&str>) -> Vec<PlannedStep> {
+    let step = |c: String| PlannedStep { command: c, always: false };
+    let mut steps = vec![step(format!("git {} --abort", op.as_str()))];
+    match start_branch {
+        Some(b) => steps.push(step(format!("git checkout {}", sh_quote(b)))),
+        // rebase --abort already returns to the original branch.
+        None if op == Operation::Merge => steps.push(step("git checkout -".into())),
+        None => {}
+    }
+    steps
+}
+
+#[tauri::command]
+pub async fn conflict_files(state: State<'_, PtyState>) -> Result<Vec<String>, String> {
+    Ok(git::conflicted_files(&repo_root(&state)?))
+}
+
+/// Finishes the merge/rebase (conflicts must be resolved and staged), then runs
+/// the rest of the suspended recipe.
+#[tauri::command]
+pub async fn conflict_continue(app: AppHandle, state: State<'_, PtyState>) -> Result<(), String> {
+    let root = repo_root(&state)?;
+    let conflicted = git::conflicted_files(&root);
+    if !conflicted.is_empty() {
+        return Err(format!(
+            "Fix the conflicts and `git add` these files first: {}",
+            conflicted.join(", ")
+        ));
+    }
+    let suspended = state.shared.lock().unwrap().runner.suspended.clone();
+    let mut steps = vec![];
+    if let Some(op) = git::operation_in_progress(&root) {
+        steps.push(PlannedStep { command: continue_command(op).into(), always: false });
+    }
+    let (name, start_branch) = match suspended {
+        Some(s) => {
+            steps.extend(s.remaining);
+            (format!("{} (continued)", s.name), s.start_branch)
+        }
+        None => ("Continue".to_string(), None),
+    };
+    if steps.is_empty() {
+        return Err("Nothing to continue.".into());
+    }
+    start_in_app(&app, &state, RunMeta { name, start_branch }, steps)
+}
+
+/// Aborts the operation in progress and returns to the branch the recipe started on.
+#[tauri::command]
+pub async fn conflict_abort(app: AppHandle, state: State<'_, PtyState>) -> Result<(), String> {
+    let root = repo_root(&state)?;
+    let op = git::operation_in_progress(&root).ok_or("No merge, rebase, cherry-pick or revert is in progress.")?;
+    let start_branch = state.shared.lock().unwrap().runner.suspended.as_ref().and_then(|s| s.start_branch.clone());
+    let steps = abort_steps(op, start_branch.as_deref());
+    start_in_app(&app, &state, RunMeta { name: "Abort & go back".into(), start_branch: None }, steps)
 }
 
 #[cfg(test)]
@@ -312,6 +427,10 @@ mod tests {
         PlannedStep { command: cmd.into(), always }
     }
 
+    fn meta(name: &str) -> RunMeta {
+        RunMeta { name: name.into(), start_branch: Some("feat".into()) }
+    }
+
     fn ready_shell() -> ShellStatus {
         ShellStatus { integration: true, ready: true, idle: true, cwd: None }
     }
@@ -326,39 +445,40 @@ mod tests {
 
     #[test]
     fn runs_steps_in_order_until_done() {
-        let (mut shell, mut slot, mut sink) = (ready_shell(), None, VecSink(vec![]));
-        start(&mut shell, &mut slot, &mut sink, "r".into(), vec![step("a", false), step("b", false)]).unwrap();
+        let (mut shell, mut st, mut sink) = (ready_shell(), RunnerState::default(), VecSink(vec![]));
+        start(&mut shell, &mut st, &mut sink, meta("r"), vec![step("a", false), step("b", false)]).unwrap();
         assert_eq!(sink.0, vec!["\x05\x15a\r"]);
         assert!(!shell.idle);
         // A second start while running is refused.
-        assert!(start(&mut shell, &mut slot, &mut sink, "r".into(), vec![step("x", false)]).is_err());
-        let ev = handle_prompt(&mut shell, &mut slot, &mut sink, prompt(0));
+        assert!(start(&mut shell, &mut st, &mut sink, meta("r"), vec![step("x", false)]).is_err());
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, prompt(0));
         assert!(done(&ev).is_none());
         assert_eq!(sink.0[1], "\x05\x15b\r");
-        let ev = handle_prompt(&mut shell, &mut slot, &mut sink, prompt(0));
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, prompt(0));
         assert_eq!(done(&ev).unwrap().status, RunStatus::Ok);
-        assert!(slot.is_none());
+        assert!(st.run.is_none() && st.suspended.is_none());
     }
 
     #[test]
     fn stops_at_first_failure_but_runs_always_steps() {
-        let (mut shell, mut slot, mut sink) = (ready_shell(), None, VecSink(vec![]));
+        let (mut shell, mut st, mut sink) = (ready_shell(), RunnerState::default(), VecSink(vec![]));
         let steps = vec![step("a", false), step("b", false), step("c", true)];
-        start(&mut shell, &mut slot, &mut sink, "r".into(), steps).unwrap();
-        let ev = handle_prompt(&mut shell, &mut slot, &mut sink, prompt(1));
+        start(&mut shell, &mut st, &mut sink, meta("r"), steps).unwrap();
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, prompt(1));
         assert!(ev.iter().any(|e| matches!(e, Event::Step(s) if s.index == 1 && s.state == StepState::Skipped)));
         assert_eq!(sink.0.last().unwrap(), "\x05\x15c\r");
-        let ev = handle_prompt(&mut shell, &mut slot, &mut sink, prompt(0));
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, prompt(0));
         let d = done(&ev).unwrap();
         assert_eq!((d.status, d.failed_step, d.exit_code), (RunStatus::Failed, Some(0), Some(1)));
+        assert!(st.suspended.is_none(), "no conflict, nothing to continue");
     }
 
     #[test]
     fn cancel_skips_everything_else() {
-        let (mut shell, mut slot, mut sink) = (ready_shell(), None, VecSink(vec![]));
-        start(&mut shell, &mut slot, &mut sink, "r".into(), vec![step("a", false), step("b", true)]).unwrap();
-        slot.as_mut().unwrap().cancel_requested = true;
-        let ev = handle_prompt(&mut shell, &mut slot, &mut sink, prompt(130));
+        let (mut shell, mut st, mut sink) = (ready_shell(), RunnerState::default(), VecSink(vec![]));
+        start(&mut shell, &mut st, &mut sink, meta("r"), vec![step("a", false), step("b", true)]).unwrap();
+        st.run.as_mut().unwrap().cancel_requested = true;
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, prompt(130));
         assert_eq!(done(&ev).unwrap().status, RunStatus::Cancelled);
         assert_eq!(sink.0.len(), 1);
     }
@@ -367,9 +487,42 @@ mod tests {
     fn refuses_when_not_ready() {
         let mut sink = VecSink(vec![]);
         let mut busy = ShellStatus { idle: false, ..ready_shell() };
-        assert!(start(&mut busy, &mut None, &mut sink, "r".into(), vec![step("a", false)]).is_err());
+        assert!(start(&mut busy, &mut RunnerState::default(), &mut sink, meta("r"), vec![step("a", false)]).is_err());
         let mut plain = ShellStatus { integration: false, ..ready_shell() };
-        assert!(start(&mut plain, &mut None, &mut sink, "r".into(), vec![step("a", false)]).is_err());
+        assert!(start(&mut plain, &mut RunnerState::default(), &mut sink, meta("r"), vec![step("a", false)]).is_err());
+    }
+
+    #[test]
+    fn conflict_suspends_remaining_steps() {
+        let r = TempRepo::new("suspend");
+        r.git(&["checkout", "-q", "-b", "a"]);
+        std::fs::write(r.work.join("README.md"), "a\n").unwrap();
+        r.git(&["commit", "-q", "-am", "a"]);
+        r.git(&["checkout", "-q", "main"]);
+        std::fs::write(r.work.join("README.md"), "main\n").unwrap();
+        r.git(&["commit", "-q", "-am", "main"]);
+        let _ = std::process::Command::new("git").args(["merge", "a"]).current_dir(&r.work).output();
+
+        let mut shell = ShellStatus { cwd: Some(r.work.clone()), ..ready_shell() };
+        let (mut st, mut sink) = (RunnerState::default(), VecSink(vec![]));
+        let steps = vec![step("git merge a", false), step("git push", false), step("git checkout feat", true)];
+        start(&mut shell, &mut st, &mut sink, meta("Merge into…"), steps).unwrap();
+        let ev = handle_prompt(&mut shell, &mut st, &mut sink, Prompt { exit_code: 1, cwd: r.work.display().to_string() });
+        let d = done(&ev).unwrap();
+        assert_eq!(d.operation, Some(Operation::Merge));
+        assert_eq!(d.remaining, 2);
+        let s = st.suspended.as_ref().unwrap();
+        assert_eq!(s.remaining[0].command, "git push");
+        assert_eq!(s.start_branch.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn abort_and_continue_commands() {
+        let cmds = |s: Vec<PlannedStep>| s.into_iter().map(|p| p.command).collect::<Vec<_>>();
+        assert_eq!(cmds(abort_steps(Operation::Merge, Some("feat/x"))), ["git merge --abort", "git checkout 'feat/x'"]);
+        assert_eq!(cmds(abort_steps(Operation::Merge, None)), ["git merge --abort", "git checkout -"]);
+        assert_eq!(cmds(abort_steps(Operation::Rebase, None)), ["git rebase --abort"]);
+        assert_eq!(continue_command(Operation::Rebase), "GIT_EDITOR=true git rebase --continue");
     }
 
     struct PipeSink(Box<dyn Write + Send>);
@@ -435,9 +588,9 @@ mod tests {
         let next = || rx.recv_timeout(Duration::from_secs(30)).expect("no prompt marker from the shell");
 
         let mut shell = ShellStatus { integration: true, ..Default::default() };
-        let mut slot = None;
+        let mut st = RunnerState::default();
         let first = next();
-        handle_prompt(&mut shell, &mut slot, &mut *writer.lock().unwrap(), first);
+        handle_prompt(&mut shell, &mut st, &mut *writer.lock().unwrap(), first);
         assert!(shell.ready && shell.idle);
         assert!(shell.cwd.as_ref().unwrap().join(".git").exists(), "cwd from marker: {:?}", shell.cwd);
 
@@ -450,10 +603,10 @@ mod tests {
             step("echo never-runs", false),
             step("git checkout -q main", true),
         ];
-        let mut all = start(&mut shell, &mut slot, &mut *writer.lock().unwrap(), "e2e".into(), steps).unwrap();
-        while slot.is_some() {
+        let mut all = start(&mut shell, &mut st, &mut *writer.lock().unwrap(), meta("e2e"), steps).unwrap();
+        while st.run.is_some() {
             let p = next();
-            all.extend(handle_prompt(&mut shell, &mut slot, &mut *writer.lock().unwrap(), p));
+            all.extend(handle_prompt(&mut shell, &mut st, &mut *writer.lock().unwrap(), p));
         }
         let _ = child.kill();
 

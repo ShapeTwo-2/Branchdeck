@@ -5,6 +5,7 @@
 //!   path: C:\Program Files\Git\bin\bash.exe
 //!   args: [--login, -i]
 //! startDir: ~/code
+//! protectedBranches: [main, master, prod, production, staging, "release/*"]
 //! ```
 
 use serde::Deserialize;
@@ -17,6 +18,8 @@ pub const APP_DIR_NAME: &str = ".branchdeck";
 pub struct Config {
     pub shell: Option<ShellConfig>,
     pub start_dir: Option<String>,
+    /// Replaces the default protected branches (a repo's .branchdeck.yml can override again).
+    pub protected_branches: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,0 +1,78 @@
+# Branchdeck built-in recipes.
+#
+# Override any of these by id in ~/.branchdeck/recipes.yml or in .branchdeck.yml
+# at your repo root, or hide one with `- { id: <id>, disabled: true }`.
+#
+# Placeholders like {{branch}} are always inserted as a safely quoted shell word.
+# Built-in variables: {{current_branch}}, {{default_branch}}, {{repo_root}}.
+
+- id: bcp
+  name: New branch + commit + push
+  description: Create a branch, commit all changes, push and set upstream
+  inputs:
+    - { id: branch, label: Branch name, type: branch, placeholder: feature/login, required: true }
+    - { id: msg, label: Commit message, required: true }
+  steps:
+    - git checkout -b "{{branch}}"
+    - git add -A
+    - git commit -m "{{msg}}"
+    - git push -u origin "{{branch}}"
+
+- id: merge-into
+  name: Merge into…
+  description: Merge the current branch into dev/staging/prod, push, then come back
+  confirm: true
+  inputs:
+    - { id: target, label: Target branch, type: select, options: [dev, staging, prod], default: dev }
+    - { id: no_ff, label: Always create a merge commit (--no-ff), type: bool, default: true }
+  steps:
+    - git checkout "{{target}}"
+    - git pull --ff-only
+    - run: git merge --no-ff "{{current_branch}}"
+      when: no_ff
+    - run: git merge "{{current_branch}}"
+      when: "!no_ff"
+    - git push
+    - run: git checkout "{{current_branch}}"
+      always: true
+
+- id: sync-main
+  name: Sync with main
+  description: Fetch, then rebase onto or merge the default branch from origin
+  inputs:
+    - { id: strategy, label: How, type: select, options: [rebase, merge], default: rebase }
+  steps:
+    - git fetch origin
+    - run: git rebase "origin/{{default_branch}}"
+      when: strategy == rebase
+    - run: git merge "origin/{{default_branch}}"
+      when: strategy == merge
+
+- id: stash-switch
+  name: Stash & switch
+  description: Stash all changes (including untracked), switch branch, optionally bring the changes along
+  inputs:
+    - { id: branch, label: Switch to, type: branch, required: true }
+    - { id: pop, label: Pop the stash on the new branch, type: bool, default: false }
+  steps:
+    - 'git stash push -u -m "branchdeck: switch to {{branch}}"'
+    - git switch "{{branch}}"
+    # Only pop the stash this recipe created, never an older one.
+    # (YAML single quotes because the command contains ": ".)
+    - run: 'if git stash list -1 --format=%s | grep -qxF "On {{current_branch}}: branchdeck: switch to {{branch}}"; then git stash pop; else echo "Nothing was stashed, skipping pop"; fi'
+      when: pop
+
+- id: undo-commit
+  name: Undo last commit
+  description: Remove the last commit but keep its changes staged
+  confirm: true
+  steps:
+    - git reset --soft HEAD~1
+
+- id: clean-merged
+  name: Clean merged branches
+  description: Delete local branches already merged into the default branch
+  confirm: true
+  steps:
+    - git fetch --prune
+    - git branch --merged "{{default_branch}}" --format="%(refname:short)" | grep -vxF -e "{{default_branch}}" -e "{{current_branch}}" -e main -e master -e dev -e develop -e staging -e prod -e production | grep -v "^release/" | xargs -r git branch -d

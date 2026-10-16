@@ -1,13 +1,121 @@
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { Terminal } from "./components/Terminal";
+import { RecipeDialog } from "./components/RecipeDialog";
+import { RunPanel, type RunView } from "./components/RunPanel";
+import { AddRecipeDialog } from "./components/AddRecipeDialog";
+import { onPrompt, onPtyExit, onRunDone, onRunStarted, onRunStep, recipesList } from "./lib/ipc";
+import type { Recipe, RecipeList, SpawnInfo } from "./lib/types";
 
 export default function App() {
+  const [listening, setListening] = useState(false);
+  const [spawn, setSpawn] = useState<SpawnInfo | null>(null);
+  const [ready, setReady] = useState(false);
+  const [list, setList] = useState<RecipeList | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [run, setRun] = useState<RunView | null>(null);
+  const [openRecipe, setOpenRecipe] = useState<Recipe | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const cwdRef = useRef<string | null>(null);
+  const focusTerminal = useRef<() => void>(() => {});
+
+  const refresh = useCallback(() => {
+    recipesList()
+      .then((l) => {
+        setList(l);
+        setListError(null);
+      })
+      .catch((e) => setListError(String(e)));
+  }, []);
+
+  // Subscribe before the terminal mounts so the shell's first prompt isn't missed.
+  useEffect(() => {
+    const subs = [
+      onPrompt((p) => {
+        setReady(true);
+        if (p.cwd && p.cwd !== cwdRef.current) {
+          cwdRef.current = p.cwd;
+          refresh();
+        }
+      }),
+      onPtyExit(() => setReady(false)),
+      onRunStarted((s) =>
+        setRun({
+          name: s.name,
+          steps: s.steps,
+          states: s.steps.map(() => "pending"),
+          exitCodes: s.steps.map(() => null),
+          notes: s.steps.map(() => null),
+          done: null,
+        }),
+      ),
+      onRunStep((e) =>
+        setRun((r) => {
+          if (!r) return r;
+          const states = [...r.states];
+          const exitCodes = [...r.exitCodes];
+          const notes = [...r.notes];
+          states[e.index] = e.state;
+          exitCodes[e.index] = e.exitCode;
+          notes[e.index] = e.note;
+          return { ...r, states, exitCodes, notes };
+        }),
+      ),
+      onRunDone((d) => {
+        setRun((r) => (r ? { ...r, done: d } : r));
+        refresh();
+      }),
+    ];
+    Promise.all(subs).then(() => setListening(true));
+    return () => {
+      subs.forEach((p) => void p.then((off) => off()));
+    };
+  }, [refresh]);
+
+  const running = !!run && !run.done;
+  let disabledReason: string | null = null;
+  if (!spawn) disabledReason = "Starting the shell…";
+  else if (!spawn.integration)
+    disabledReason = "Recipes need bash or zsh with Branchdeck's shell integration. Remove custom shell args from ~/.branchdeck/config.yml.";
+  else if (!ready) disabledReason = "Waiting for the shell prompt…";
+  else if (running) disabledReason = "A recipe is running.";
+
+  const dismissRun = useCallback(() => {
+    setRun(null);
+    focusTerminal.current();
+  }, []);
+
+  const closeDialog = () => {
+    setOpenRecipe(null);
+    setAddOpen(false);
+    focusTerminal.current();
+  };
+
   return (
     <div className="app">
-      <Sidebar />
+      <Sidebar
+        list={list}
+        listError={listError}
+        disabledReason={disabledReason}
+        onRefresh={refresh}
+        onOpen={setOpenRecipe}
+        onAdd={() => setAddOpen(true)}
+      />
       <main className="main">
-        <Terminal />
+        {run && <RunPanel run={run} onDismiss={dismissRun} />}
+        {listening && (
+          <Terminal
+            onSpawned={(info) => {
+              setSpawn(info);
+              setReady(false);
+              cwdRef.current = null;
+            }}
+            focusRef={focusTerminal}
+          />
+        )}
       </main>
+      {openRecipe && <RecipeDialog key={openRecipe.id} recipe={openRecipe} onClose={closeDialog} />}
+      {addOpen && <AddRecipeDialog globalFile={list?.globalFile ?? null} repoRoot={list?.repoRoot ?? null} onClose={closeDialog} />}
     </div>
   );
 }

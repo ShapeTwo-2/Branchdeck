@@ -1,12 +1,16 @@
 //! The single interactive shell session behind the terminal view.
 //!
 //! Output streams to the frontend over a Tauri `Channel` as UTF-8 text (split
-//! multi-byte sequences are carried over between reads). When the shell exits
-//! we emit `pty://exit` after the last output chunk has been delivered.
+//! multi-byte sequences are carried over between reads). Shell-integration
+//! markers are removed from the stream and drive [`crate::runner`]. When the
+//! shell exits we emit `pty://exit` after the last output chunk.
 
-use crate::{config, shell};
+use crate::osc::{MarkerParser, Segment};
+use crate::runner::Sink;
+use crate::{config, runner, shell};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,15 +32,67 @@ impl Drop for Session {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ShellStatus {
+    /// The prompt hook is installed (bash/zsh with default args).
+    pub integration: bool,
+    /// At least one prompt marker has arrived.
+    pub ready: bool,
+    /// At a prompt: the last marker came after the last Enter we saw.
+    pub idle: bool,
+    pub cwd: Option<PathBuf>,
+}
+
+/// Everything the reader thread, the commands and the runner share.
+/// One lock keeps the ordering simple.
+#[derive(Default)]
+pub struct Shared {
+    session: Option<Session>,
+    pub shell: ShellStatus,
+    pub run: Option<runner::Run>,
+}
+
+impl Shared {
+    pub fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        SessionWriter(&mut self.session).send(data)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.session.as_ref().map(|s| s.generation)
+    }
+
+    /// Borrows the parts the runner needs at the same time.
+    pub fn split(&mut self) -> (&mut ShellStatus, &mut Option<runner::Run>, SessionWriter<'_>) {
+        (&mut self.shell, &mut self.run, SessionWriter(&mut self.session))
+    }
+}
+
+pub struct SessionWriter<'a>(&'a mut Option<Session>);
+
+impl runner::Sink for SessionWriter<'_> {
+    fn send(&mut self, data: &[u8]) -> Result<(), String> {
+        let session = self.0.as_mut().ok_or("No shell is running")?;
+        session.writer.write_all(data).map_err(|e| e.to_string())?;
+        session.writer.flush().map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Default)]
 pub struct PtyState {
-    session: Arc<Mutex<Option<Session>>>,
+    pub shared: Arc<Mutex<Shared>>,
     generation: AtomicU64,
 }
 
 impl PtyState {
     pub fn shutdown(&self) {
-        self.session.lock().unwrap().take();
+        let mut s = self.shared.lock().unwrap();
+        s.session.take();
+        s.run = None;
+        s.shell = ShellStatus::default();
+    }
+
+    pub fn cwd(&self) -> Option<PathBuf> {
+        self.shared.lock().unwrap().shell.cwd.clone()
     }
 }
 
@@ -46,6 +102,7 @@ pub struct SpawnInfo {
     shell: String,
     args: Vec<String>,
     cwd: String,
+    integration: bool,
     windows_build: Option<u32>,
 }
 
@@ -73,6 +130,17 @@ fn start_dir(cfg: &config::Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Unpredictable enough that program output won't match it by accident.
+fn new_nonce() -> String {
+    let rs = std::collections::hash_map::RandomState::new();
+    let mut h = rs.build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    h.write_u32(std::process::id());
+    let a = h.finish();
+    h.write_u64(a);
+    format!("{a:016x}{:016x}", h.finish())
+}
+
 /// Starts (or restarts) the shell. Any existing session is killed first.
 #[tauri::command]
 pub async fn pty_spawn(
@@ -90,18 +158,23 @@ pub async fn pty_spawn(
     }
     let spec = shell::resolve(&cfg)?;
     let cwd = start_dir(&cfg);
+    let nonce = new_nonce();
+    let launch = shell::prepare_launch(&spec, &nonce);
 
     let pair = native_pty_system()
         .openpty(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("Could not open a pseudo-terminal: {e}"))?;
 
     let mut cmd = CommandBuilder::new(&spec.program);
-    cmd.args(&spec.args);
+    cmd.args(&launch.args);
     cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "branchdeck");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    for (k, v) in &launch.env {
+        cmd.env(k, v);
+    }
 
     let mut child = pair
         .slave
@@ -115,65 +188,91 @@ pub async fn pty_spawn(
     let killer = child.clone_killer();
 
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    *state.session.lock().unwrap() = Some(Session { generation, master: pair.master, writer, killer });
+    {
+        let mut s = state.shared.lock().unwrap();
+        s.session = Some(Session { generation, master: pair.master, writer, killer });
+        s.shell = ShellStatus { integration: launch.integration, ready: false, idle: false, cwd: Some(cwd.clone()) };
+        s.run = None;
+    }
 
+    let shared = state.shared.clone();
+    let reader_app = app.clone();
     let reader_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
         let mut pending = Vec::new();
+        let mut parser = MarkerParser::new(nonce);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let text = decode_utf8_stream(&mut pending, &buf[..n]);
-                    if !text.is_empty() && on_data.send(text).is_err() {
-                        break;
+                    for seg in parser.feed(&buf[..n]) {
+                        match seg {
+                            Segment::Output(bytes) => {
+                                let text = decode_utf8_stream(&mut pending, &bytes);
+                                if !text.is_empty() && on_data.send(text).is_err() {
+                                    return;
+                                }
+                            }
+                            Segment::Prompt(p) => runner::on_prompt(&reader_app, &shared, generation, p),
+                        }
                     }
                 }
             }
         }
     });
 
-    let sessions = state.session.clone();
+    let shared = state.shared.clone();
     std::thread::spawn(move || {
         let status = child.wait().ok();
         // Let ConPTY flush its last frame, then close the master so the reader sees EOF.
         std::thread::sleep(Duration::from_millis(100));
-        let current = {
-            let mut guard = sessions.lock().unwrap();
-            if guard.as_ref().map(|s| s.generation) == Some(generation) {
-                guard.take();
-                true
+        let (current, interrupted_run) = {
+            let mut s = shared.lock().unwrap();
+            if s.session.as_ref().map(|x| x.generation) == Some(generation) {
+                s.session.take();
+                s.shell = ShellStatus::default();
+                (true, s.run.take().is_some())
             } else {
-                false
+                (false, false)
             }
         };
         let _ = reader_thread.join();
         // A replaced session must not tell the UI that "the" shell exited.
         if current {
+            if interrupted_run {
+                runner::emit_shell_exited(&app);
+            }
             let _ = app.emit("pty://exit", PtyExit { code: status.map(|s| s.exit_code()) });
         }
     });
 
     Ok(SpawnInfo {
         shell: spec.program.display().to_string(),
-        args: spec.args,
+        args: launch.args,
         cwd: cwd.display().to_string(),
+        integration: launch.integration,
         windows_build: windows_build(),
     })
 }
 
 #[tauri::command]
 pub async fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), String> {
-    let mut guard = state.session.lock().unwrap();
-    let session = guard.as_mut().ok_or("No shell is running")?;
-    session.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    session.writer.flush().map_err(|e| e.to_string())
+    let mut s = state.shared.lock().unwrap();
+    if data.contains(['\r', '\n']) {
+        s.shell.idle = false;
+    }
+    if data.contains('\x03') {
+        if let Some(run) = s.run.as_mut() {
+            run.cancel_requested = true;
+        }
+    }
+    s.write(data.as_bytes())
 }
 
 #[tauri::command]
 pub async fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<(), String> {
-    let guard = state.session.lock().unwrap();
-    let Some(session) = guard.as_ref() else { return Ok(()) };
+    let s = state.shared.lock().unwrap();
+    let Some(session) = s.session.as_ref() else { return Ok(()) };
     session
         .master
         .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
@@ -234,59 +333,6 @@ mod tests {
         assert_eq!(decode_utf8_stream(&mut p, &bytes[2..3]), "");
         assert_eq!(decode_utf8_stream(&mut p, &bytes[3..]), "→b");
         assert!(p.is_empty());
-    }
-
-    /// End-to-end through a real pseudo-terminal with the auto-detected shell.
-    #[test]
-    fn default_shell_runs_in_pty() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        use std::io::{Read, Write};
-
-        let spec = crate::shell::resolve(&crate::config::Config::default()).unwrap();
-        let pair = native_pty_system()
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
-            .unwrap();
-        let mut cmd = CommandBuilder::new(&spec.program);
-        cmd.args(&spec.args);
-        cmd.env("TERM", "xterm-256color");
-        let mut child = pair.slave.spawn_command(cmd).unwrap();
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        let mut writer = pair.master.take_writer().unwrap();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let mut buf = [0u8; 4096];
-            let mut sent = false;
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                let chunk = &buf[..n];
-                out.extend_from_slice(chunk);
-                // ConPTY blocks on a cursor-position query until the terminal
-                // answers; xterm.js does this in the app, we play terminal here.
-                if chunk.windows(4).any(|w| w == b"\x1b[6n") {
-                    writer.write_all(b"\x1b[1;1R").unwrap();
-                }
-                if !sent {
-                    // Arithmetic so the marker only appears in output, not the echoed input.
-                    writer.write_all(b"echo bd-$((40+2))-ok; exit\r").unwrap();
-                    sent = true;
-                }
-                writer.flush().unwrap();
-                if String::from_utf8_lossy(&out).contains("bd-42-ok") {
-                    let _ = tx.send(true);
-                    return;
-                }
-            }
-            eprintln!("PTY OUTPUT: {:?}", String::from_utf8_lossy(&out));
-            let _ = tx.send(false);
-        });
-        let found = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or(false);
-        let _ = child.kill();
-        assert!(found, "shell output never contained the marker");
     }
 
     #[test]

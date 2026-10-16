@@ -1,5 +1,9 @@
 ﻿mod config;
+mod git;
+mod osc;
 mod pty;
+mod recipes;
+mod runner;
 mod shell;
 
 use tauri::Manager;
@@ -8,7 +12,15 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .manage(pty::PtyState::default())
-        .invoke_handler(tauri::generate_handler![pty::pty_spawn, pty::pty_write, pty::pty_resize])
+        .invoke_handler(tauri::generate_handler![
+            pty::pty_spawn,
+            pty::pty_write,
+            pty::pty_resize,
+            recipes::recipes_list,
+            recipes::recipe_plan,
+            recipes::recipe_run,
+            runner::recipe_cancel,
+        ])
         .build(tauri::generate_context!())
         .expect("error while building Branchdeck")
         .run(|app, event| {

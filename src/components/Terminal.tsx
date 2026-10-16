@@ -3,6 +3,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { onPtyExit, ptyResize, ptySpawn, ptyWrite } from "../lib/ipc";
+import type { SpawnInfo } from "../lib/types";
 
 const THEME = {
   background: "#14161b",
@@ -41,8 +42,16 @@ async function copyText(text: string) {
   }
 }
 
-export function Terminal() {
+interface Props {
+  onSpawned: (info: SpawnInfo) => void;
+  /** Filled with a function that focuses the terminal. */
+  focusRef: React.MutableRefObject<() => void>;
+}
+
+export function Terminal({ onSpawned, focusRef }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const onSpawnedRef = useRef(onSpawned);
+  onSpawnedRef.current = onSpawned;
 
   useEffect(() => {
     const host = hostRef.current!;
@@ -86,6 +95,7 @@ export function Terminal() {
           if (info.windowsBuild) {
             term.options.windowsPty = { backend: "conpty", buildNumber: info.windowsBuild };
           }
+          onSpawnedRef.current(info);
         })
         .catch((err) => {
           term.write(`\r\n\x1b[31mFailed to start shell: ${err}\x1b[0m\r\n`);
@@ -119,11 +129,13 @@ export function Terminal() {
     });
     ro.observe(host);
 
+    focusRef.current = () => term.focus();
     spawn();
     term.focus();
 
     return () => {
       disposed = true;
+      focusRef.current = () => {};
       ro.disconnect();
       cancelAnimationFrame(frame);
       dataSub.dispose();

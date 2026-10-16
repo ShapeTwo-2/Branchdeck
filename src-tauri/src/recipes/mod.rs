@@ -50,6 +50,9 @@ pub struct RecipeList {
 }
 
 fn find(cwd: Option<&Path>, id: &str) -> Result<(Recipe, git::RepoContext), String> {
+    if git::install().is_none() {
+        return Err(format!("Git was not found. {}", git::install_hint()));
+    }
     let ctx = cwd.map(git::context).unwrap_or_default();
     let loaded = loader::load(ctx.root.as_deref());
     let recipe = loaded

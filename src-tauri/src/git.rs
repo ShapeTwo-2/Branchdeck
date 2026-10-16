@@ -1,24 +1,111 @@
 //! Read-only git queries via the git CLI (never libgit2), so the user's
 //! config, aliases and safe.directory rules apply.
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-/// Runs `git <args>` in `cwd`; returns trimmed stdout on exit code 0.
-pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0");
+/// The git executable Branchdeck uses for its own (read-only) queries.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInstall {
+    pub program: PathBuf,
+    /// e.g. "2.52.0.windows.1"
+    pub version: String,
+}
+
+fn command(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().ok()?;
+    cmd
+}
+
+fn probe(program: &Path) -> Option<GitInstall> {
+    let out = command(program).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // On macOS without the Command Line Tools, /usr/bin/git is a stub that fails here.
+    let version = text.trim().strip_prefix("git version ")?.to_string();
+    out.status.success().then(|| GitInstall { program: program.to_path_buf(), version })
+}
+
+/// Finds git once per run: PATH first, then (on Windows) the Git for Windows
+/// install folder, for installs that put only Git Bash on PATH.
+pub fn install() -> Option<&'static GitInstall> {
+    static GIT: OnceLock<Option<GitInstall>> = OnceLock::new();
+    GIT.get_or_init(|| {
+        if let Some(found) = probe(Path::new("git")) {
+            return Some(found);
+        }
+        #[cfg(windows)]
+        {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Some(bash) = crate::shell::find_git_bash() {
+                // <root>\bin\bash.exe -> <root>\cmd\git.exe
+                if let Some(root) = bash.parent().and_then(Path::parent) {
+                    candidates.push(root.join("cmd").join("git.exe"));
+                }
+            }
+            for var in ["ProgramW6432", "ProgramFiles", "LOCALAPPDATA"] {
+                if let Ok(p) = std::env::var(var) {
+                    let base = PathBuf::from(p);
+                    candidates.push(base.join("Git").join("cmd").join("git.exe"));
+                    candidates.push(base.join("Programs").join("Git").join("cmd").join("git.exe"));
+                }
+            }
+            if let Some(found) = candidates.iter().filter(|c| c.is_file()).find_map(|c| probe(c)) {
+                return Some(found);
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+/// Runs `git <args>` in `cwd`; returns trimmed stdout on exit code 0.
+/// None if git is missing or the command fails.
+pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = command(&install()?.program).args(args).current_dir(cwd).output().ok()?;
     if !out.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Like [`git`] but returns raw stdout (for `-z` output).
+pub fn git_raw(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = command(&install()?.program).args(args).current_dir(cwd).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Install hint for the current OS, shown when git is missing.
+pub fn install_hint() -> &'static str {
+    if cfg!(windows) {
+        "Install Git for Windows from https://git-scm.com/download/win, then restart Branchdeck."
+    } else if cfg!(target_os = "macos") {
+        "Run `xcode-select --install` (or install git with Homebrew), then restart Branchdeck."
+    } else {
+        "Install git with your package manager (e.g. `sudo apt install git`), then restart Branchdeck."
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInfo {
+    /// None when git can't be found.
+    install: Option<GitInstall>,
+    install_hint: &'static str,
+}
+
+#[tauri::command]
+pub async fn git_info() -> Result<GitInfo, String> {
+    Ok(GitInfo { install: install().cloned(), install_hint: install_hint() })
 }
 
 /// Facts about the repo that recipes can reference as built-in variables.
@@ -203,6 +290,15 @@ pub mod testutil {
 mod tests {
     use super::testutil::TempRepo;
     use super::*;
+
+    /// The fallback used when only Git Bash (not git.exe) is on PATH.
+    #[cfg(windows)]
+    #[test]
+    fn finds_git_next_to_git_bash() {
+        let bash = crate::shell::find_git_bash().unwrap();
+        let git_exe = bash.parent().and_then(Path::parent).unwrap().join("cmd").join("git.exe");
+        assert!(probe(&git_exe).is_some(), "{}", git_exe.display());
+    }
 
     #[test]
     fn context_in_repo() {

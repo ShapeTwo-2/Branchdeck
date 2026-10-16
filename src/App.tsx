@@ -4,11 +4,24 @@ import { Terminal } from "./components/Terminal";
 import { RecipeDialog } from "./components/RecipeDialog";
 import { RunPanel, type RunView } from "./components/RunPanel";
 import { AddRecipeDialog } from "./components/AddRecipeDialog";
-import { onPrompt, onPtyExit, onRunDone, onRunStarted, onRunStep, recipesList } from "./lib/ipc";
-import type { Recipe, RecipeList, SpawnInfo } from "./lib/types";
+import { StatusBar } from "./components/StatusBar";
+import {
+  gitInfo,
+  onGitStatus,
+  onPrompt,
+  onPtyExit,
+  onRunDone,
+  onRunStarted,
+  onRunStep,
+  recipesList,
+  statusRefresh,
+} from "./lib/ipc";
+import type { GitInfo, Recipe, RecipeList, RepoStatus, SpawnInfo } from "./lib/types";
 
 export default function App() {
   const [listening, setListening] = useState(false);
+  const [git, setGit] = useState<GitInfo | null>(null);
+  const [status, setStatus] = useState<RepoStatus | null>(null);
   const [spawn, setSpawn] = useState<SpawnInfo | null>(null);
   const [ready, setReady] = useState(false);
   const [list, setList] = useState<RecipeList | null>(null);
@@ -65,6 +78,7 @@ export default function App() {
         setRun((r) => (r ? { ...r, done: d } : r));
         refresh();
       }),
+      onGitStatus(setStatus),
     ];
     Promise.all(subs).then(() => setListening(true));
     return () => {
@@ -72,9 +86,24 @@ export default function App() {
     };
   }, [refresh]);
 
+  // Startup check: is git installed?
+  useEffect(() => {
+    gitInfo()
+      .then(setGit)
+      .catch(() => setGit({ install: null, installHint: "Could not check for git." }));
+  }, []);
+
+  // Commits made elsewhere (an editor, another terminal) show up when you come back.
+  useEffect(() => {
+    const onFocus = () => void statusRefresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
   const running = !!run && !run.done;
   let disabledReason: string | null = null;
-  if (!spawn) disabledReason = "Starting the shell…";
+  if (git && !git.install) disabledReason = "Recipes need git. See the message above.";
+  else if (!spawn) disabledReason = "Starting the shell…";
   else if (!spawn.integration)
     disabledReason = "Recipes need bash or zsh with Branchdeck's shell integration. Remove custom shell args from ~/.branchdeck/config.yml.";
   else if (!ready) disabledReason = "Waiting for the shell prompt…";
@@ -94,6 +123,7 @@ export default function App() {
   return (
     <div className="app">
       <Sidebar
+        statusBar={<StatusBar git={git} status={status} onRefresh={() => void statusRefresh()} />}
         list={list}
         listError={listError}
         disabledReason={disabledReason}

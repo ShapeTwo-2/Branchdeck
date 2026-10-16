@@ -4,11 +4,13 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  GitInfo,
   InputValues,
   Plan,
   PromptEvent,
   PtyExit,
   RecipeList,
+  RepoStatus,
   RunDone,
   RunStarted,
   SpawnInfo,
@@ -31,6 +33,15 @@ export function ptyResize(cols: number, rows: number): Promise<void> {
 
 export function recipesList(): Promise<RecipeList> {
   return invoke<RecipeList>("recipes_list");
+}
+
+export function gitInfo(): Promise<GitInfo> {
+  return invoke<GitInfo>("git_info");
+}
+
+/** Result arrives as a `git://status` event. */
+export function statusRefresh(): Promise<void> {
+  return invoke("status_refresh");
 }
 
 export function gitBranches(): Promise<string[]> {
@@ -59,3 +70,4 @@ export const onPrompt = (h: (e: PromptEvent) => void) => on("shell://prompt", h)
 export const onRunStarted = (h: (e: RunStarted) => void) => on("run://started", h);
 export const onRunStep = (h: (e: StepEvent) => void) => on("run://step", h);
 export const onRunDone = (h: (e: RunDone) => void) => on("run://done", h);
+export const onGitStatus = (h: (e: RepoStatus) => void) => on("git://status", h);

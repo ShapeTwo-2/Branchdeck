@@ -20,6 +20,35 @@ export interface PromptEvent {
   cwd: string;
 }
 
+export interface GitInstall {
+  program: string;
+  version: string;
+}
+
+export interface GitInfo {
+  /** null when git isn't installed (or can't be found). */
+  install: GitInstall | null;
+  installHint: string;
+}
+
+export interface RepoStatus {
+  cwd: string | null;
+  /** null when the terminal is not inside a repository. */
+  root: string | null;
+  /** null on a detached HEAD. */
+  branch: string | null;
+  /** Short commit id when detached. */
+  head: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  staged: number;
+  modified: number;
+  untracked: number;
+  conflicted: number;
+  operation: GitOperation | null;
+}
+
 export type InputKind = "text" | "branch" | "select" | "bool";
 
 export interface InputDef {

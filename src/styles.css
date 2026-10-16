@@ -87,15 +87,107 @@ pre {
 
 /* ---------- sidebar ---------- */
 
-.repo-line {
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .repo-name {
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- status bar ---------- */
+
+.status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.status-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.status-branch {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.branch-glyph {
+  color: var(--accent);
+}
+
+.branch-name {
+  font-family: "Cascadia Mono", "Cascadia Code", Consolas, Menlo, monospace;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-name.detached {
+  color: var(--accent);
+}
+
+.status-row {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-row:empty {
+  display: none;
+}
+
+.ahead {
+  color: #98c379;
+  margin-right: 6px;
+}
+
+.behind {
+  color: #61afef;
+  margin-right: 6px;
+}
+
+.clean {
+  color: #98c379;
+}
+
+.dirty {
+  color: var(--accent);
+}
+
+.status-warning {
+  margin-top: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: #1b1e24;
+  background: var(--accent);
+  font-weight: 600;
+}
+
+.status-error {
+  background: rgba(224, 108, 117, 0.08);
+  border-left: 3px solid #e06c75;
+}
+
+.status-title {
+  font-weight: 600;
+  color: #e06c75;
+}
+
+.status-hint {
+  color: var(--muted);
+}
+
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .recipes {

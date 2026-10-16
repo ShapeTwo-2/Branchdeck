@@ -12,7 +12,7 @@ use crate::recipes::plan::PlannedStep;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Where typed commands go: the PTY in the app, a pipe in tests.
 pub trait Sink {
@@ -255,15 +255,20 @@ pub fn handle_prompt(
 
 /// Called by the PTY reader thread for each prompt marker.
 pub fn on_prompt(app: &AppHandle, shared: &Arc<Mutex<Shared>>, generation: u64, prompt: Prompt) {
-    let events = {
+    let (events, cwd) = {
         let mut s = shared.lock().unwrap();
         if s.generation() != Some(generation) {
             return;
         }
         let (shell, run, mut sink) = s.split();
-        handle_prompt(shell, run, &mut sink, prompt)
+        let events = handle_prompt(shell, run, &mut sink, prompt);
+        (events, shell.cwd.clone())
     };
     emit(app, events);
+    // Any command may have changed the repo; refresh the status bar.
+    if let Some(cwd) = cwd {
+        app.state::<crate::status::StatusWatcher>().request(app, cwd);
+    }
 }
 
 pub fn start_in_app(app: &AppHandle, state: &State<'_, PtyState>, name: String, steps: Vec<PlannedStep>) -> Result<(), String> {

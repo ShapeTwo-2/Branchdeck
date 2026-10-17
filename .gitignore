@@ -8,3 +8,4 @@ src-tauri/gen/schemas/
 !.vscode/extensions.json
 .idea/
 .qodo/
+.claude

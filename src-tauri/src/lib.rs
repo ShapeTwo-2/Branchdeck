@@ -4,7 +4,9 @@ mod osc;
 mod pty;
 mod recipes;
 mod runner;
+mod safety;
 mod shell;
+mod status;
 
 use tauri::Manager;
 
@@ -12,6 +14,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .manage(pty::PtyState::default())
+        .manage(status::StatusWatcher::default())
         .invoke_handler(tauri::generate_handler![
             pty::pty_spawn,
             pty::pty_write,
@@ -21,6 +24,12 @@ pub fn run() {
             recipes::recipe_run,
             recipes::git_branches,
             runner::recipe_cancel,
+            runner::conflict_files,
+            runner::conflict_continue,
+            runner::conflict_abort,
+            recipes::repo_trust,
+            git::git_info,
+            status::status_refresh,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Branchdeck")

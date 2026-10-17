@@ -20,6 +20,35 @@ export interface PromptEvent {
   cwd: string;
 }
 
+export interface GitInstall {
+  program: string;
+  version: string;
+}
+
+export interface GitInfo {
+  /** null when git isn't installed (or can't be found). */
+  install: GitInstall | null;
+  installHint: string;
+}
+
+export interface RepoStatus {
+  cwd: string | null;
+  /** null when the terminal is not inside a repository. */
+  root: string | null;
+  /** null on a detached HEAD. */
+  branch: string | null;
+  /** Short commit id when detached. */
+  head: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  staged: number;
+  modified: number;
+  untracked: number;
+  conflicted: number;
+  operation: GitOperation | null;
+}
+
 export type InputKind = "text" | "branch" | "select" | "bool";
 
 export interface InputDef {
@@ -50,12 +79,21 @@ export interface LoadError {
   message: string;
 }
 
+export interface PendingTrust {
+  file: string;
+  content: string;
+  hash: string;
+  /** An earlier version was trusted; this one differs. */
+  changed: boolean;
+}
+
 export interface RecipeList {
   cwd: string | null;
   repoRoot: string | null;
   recipes: Recipe[];
   errors: LoadError[];
   globalFile: string | null;
+  pendingTrust: PendingTrust | null;
 }
 
 export type InputValues = Record<string, string | boolean>;
@@ -70,10 +108,33 @@ export interface FieldError {
   message: string;
 }
 
+export interface Risk {
+  step: number;
+  message: string;
+}
+
+export interface StageFile {
+  path: string;
+  code: string;
+  suggested: boolean;
+  reason: string | null;
+}
+
 export interface Plan {
   steps: PlannedStep[];
   errors: FieldError[];
   warnings: string[];
+  risks: Risk[];
+  dirtySwitch: { step: number; changed: number } | null;
+  staging: { step: number; files: StageFile[] } | null;
+}
+
+/** Answers from the dialog that the backend re-checks before running. */
+export interface RunChoices {
+  staged: string[] | null;
+  stashFirst: boolean;
+  allowDirtySwitch: boolean;
+  confirmed: boolean;
 }
 
 export type StepState = "pending" | "running" | "ok" | "failed" | "skipped";
@@ -96,5 +157,9 @@ export interface RunDone {
   failedStep: number | null;
   exitCode: number | null;
   operation: GitOperation | null;
+  /** Steps Resolve → Continue will run after finishing the operation. */
+  remaining: number;
+  /** Where Abort & go back returns to. */
+  startBranch: string | null;
   message: string | null;
 }

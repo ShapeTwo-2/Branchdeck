@@ -1,6 +1,6 @@
-import { useEffect } from "react";
-import { recipeCancel } from "../lib/ipc";
-import type { PlannedStep, RunDone, StepState } from "../lib/types";
+import { useEffect, useState } from "react";
+import { conflictAbort, conflictContinue, conflictFiles, recipeCancel } from "../lib/ipc";
+import type { PlannedStep, RepoStatus, RunDone, StepState } from "../lib/types";
 
 export interface RunView {
   name: string;
@@ -21,10 +21,12 @@ const ICON: Record<StepState, string> = {
 
 interface Props {
   run: RunView;
+  /** Latest repo status; conflict files are re-read whenever it changes. */
+  status: RepoStatus | null;
   onDismiss: () => void;
 }
 
-export function RunPanel({ run, onDismiss }: Props) {
+export function RunPanel({ run, status, onDismiss }: Props) {
   const { done } = run;
 
   // Successful runs get out of the way on their own.
@@ -80,13 +82,84 @@ export function RunPanel({ run, onDismiss }: Props) {
         ))}
       </ol>
       {done?.message && <div className="run-message">{done.message}</div>}
-      {done?.operation && (
-        <div className="run-message warn">
-          Git is in the middle of a {done.operation}. Resolve the conflicts in the terminal and continue, or use
-          the <strong>Abort merge/rebase &amp; go back</strong> recipe. (One-click Resolve / Abort buttons here come
-          with the safety milestone.)
+      {done?.operation && status?.operation && <ConflictActions done={done} status={status} />}
+    </section>
+  );
+}
+
+/** Resolve / Abort & go back for a recipe stopped by a merge or rebase conflict. */
+function ConflictActions({ done, status }: { done: RunDone; status: RepoStatus }) {
+  const [resolving, setResolving] = useState(false);
+  const [files, setFiles] = useState<string[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const op = status.operation ?? done.operation!;
+
+  // Re-read the conflicted files whenever the status changes (e.g. after `git add`).
+  useEffect(() => {
+    if (!resolving) return;
+    conflictFiles()
+      .then(setFiles)
+      .catch((e) => setError(String(e)));
+  }, [resolving, status]);
+
+  const act = (f: () => Promise<void>) => {
+    setError(null);
+    f().catch((e) => setError(String(e)));
+  };
+
+  const continueLabel =
+    done.remaining > 0
+      ? `Continue recipe (${done.remaining} more step${done.remaining === 1 ? "" : "s"})`
+      : `Finish the ${op}`;
+
+  return (
+    <div className="conflict-box">
+      <div className="conflict-title">
+        ⚠ The {op} stopped with conflicts{status.conflicted > 0 ? ` in ${status.conflicted} file${status.conflicted === 1 ? "" : "s"}` : ""}.
+      </div>
+      <div className="conflict-actions">
+        <button className="btn btn-small" onClick={() => setResolving((r) => !r)} aria-expanded={resolving}>
+          Resolve
+        </button>
+        <button
+          className="btn btn-small"
+          onClick={() => act(conflictAbort)}
+          title={`git ${op} --abort${done.startBranch ? `, then git checkout ${done.startBranch}` : ""}`}
+        >
+          Abort &amp; go back{done.startBranch ? ` to ${done.startBranch}` : ""}
+        </button>
+      </div>
+      {resolving && (
+        <div className="resolve-help">
+          {files === null ? (
+            <span className="muted">Looking for conflicts…</span>
+          ) : files.length > 0 ? (
+            <>
+              <p>
+                Open each file, keep the right parts between the <code>{"<<<<<<<"}</code>, <code>=======</code> and{" "}
+                <code>{">>>>>>>"}</code> markers, then run <code>git add &lt;file&gt;</code> in the terminal:
+              </p>
+              <ul className="conflict-files selectable">
+                {files.map((f) => (
+                  <li key={f}>
+                    <code>{f}</code>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p>All conflicts are resolved and staged.</p>
+          )}
+          <button
+            className="btn btn-small btn-primary"
+            disabled={files === null || files.length > 0}
+            onClick={() => act(conflictContinue)}
+          >
+            {continueLabel}
+          </button>
         </div>
       )}
-    </section>
+      {error && <div className="error-box">{error}</div>}
+    </div>
   );
 }

@@ -10,11 +10,12 @@ use crate::runner::Sink;
 use crate::{config, runner, shell};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
+use std::ffi::OsString;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -49,7 +50,7 @@ pub struct ShellStatus {
 pub struct Shared {
     session: Option<Session>,
     pub shell: ShellStatus,
-    pub run: Option<runner::Run>,
+    pub runner: runner::RunnerState,
 }
 
 impl Shared {
@@ -62,8 +63,8 @@ impl Shared {
     }
 
     /// Borrows the parts the runner needs at the same time.
-    pub fn split(&mut self) -> (&mut ShellStatus, &mut Option<runner::Run>, SessionWriter<'_>) {
-        (&mut self.shell, &mut self.run, SessionWriter(&mut self.session))
+    pub fn split(&mut self) -> (&mut ShellStatus, &mut runner::RunnerState, SessionWriter<'_>) {
+        (&mut self.shell, &mut self.runner, SessionWriter(&mut self.session))
     }
 }
 
@@ -87,7 +88,7 @@ impl PtyState {
     pub fn shutdown(&self) {
         let mut s = self.shared.lock().unwrap();
         s.session.take();
-        s.run = None;
+        s.runner = runner::RunnerState::default();
         s.shell = ShellStatus::default();
     }
 
@@ -121,13 +122,48 @@ fn windows_build() -> Option<u32> {
     }
 }
 
+/// Where the shell starts: a folder given on the command line (Explorer's
+/// "Open Branchdeck here", or `branchdeck <dir>`), else `startDir` from the
+/// config, else the home directory.
 fn start_dir(cfg: &config::Config) -> PathBuf {
-    cfg.start_dir
-        .as_deref()
-        .map(config::expand_home)
-        .filter(|p| p.is_dir())
+    launch_dir()
+        .cloned()
+        .or_else(|| cfg.start_dir.as_deref().map(config::expand_home).filter(|p| p.is_dir()))
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The folder from the command line, read once (restarting the shell reuses it).
+fn launch_dir() -> Option<&'static PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| dir_from_args(std::env::args_os().skip(1))).as_ref()
+}
+
+/// The first argument that names an existing folder (a file means its folder).
+/// Options (`-x`) are skipped, e.g. the `-psn_…` macOS may pass.
+fn dir_from_args(args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg.starts_with('-') {
+            continue;
+        }
+        // Explorer passes "%V" quoted, and for a drive root `"C:\"` the `\"`
+        // escapes the closing quote, so it arrives as `C:"`.
+        let mut s = arg.trim().trim_end_matches('"').to_string();
+        if s.len() == 2 && s.ends_with(':') {
+            s.push('\\');
+        }
+        let path = config::expand_home(&s);
+        if path.is_dir() {
+            return Some(path);
+        }
+        if path.is_file() {
+            if let Some(parent) = path.parent() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    None
 }
 
 /// Unpredictable enough that program output won't match it by accident.
@@ -192,7 +228,7 @@ pub async fn pty_spawn(
         let mut s = state.shared.lock().unwrap();
         s.session = Some(Session { generation, master: pair.master, writer, killer });
         s.shell = ShellStatus { integration: launch.integration, ready: false, idle: false, cwd: Some(cwd.clone()) };
-        s.run = None;
+        s.runner = runner::RunnerState::default();
     }
 
     let shared = state.shared.clone();
@@ -231,7 +267,7 @@ pub async fn pty_spawn(
             if s.session.as_ref().map(|x| x.generation) == Some(generation) {
                 s.session.take();
                 s.shell = ShellStatus::default();
-                (true, s.run.take().is_some())
+                (true, s.runner.run.take().is_some())
             } else {
                 (false, false)
             }
@@ -262,7 +298,7 @@ pub async fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), S
         s.shell.idle = false;
     }
     if data.contains('\x03') {
-        if let Some(run) = s.run.as_mut() {
+        if let Some(run) = s.runner.run.as_mut() {
             run.cancel_requested = true;
         }
     }
@@ -315,7 +351,36 @@ fn decode_utf8_stream(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_utf8_stream;
+    use super::{decode_utf8_stream, dir_from_args};
+    use std::ffi::OsString;
+
+    fn args(list: &[&str]) -> std::vec::IntoIter<OsString> {
+        list.iter().map(OsString::from).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn folder_from_command_line() {
+        let tmp = std::env::temp_dir();
+        let t = tmp.to_string_lossy().to_string();
+        assert_eq!(dir_from_args(args(&[&t])), Some(tmp.clone()));
+        // Flags are skipped; a quote left over from Explorer is tolerated.
+        assert_eq!(dir_from_args(args(&["-psn_0_123", &format!("{t}\"")])).as_deref(), Some(std::path::Path::new(&t)));
+        // A file opens its folder.
+        let file = tmp.join(format!("branchdeck-arg-{}.txt", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(dir_from_args(args(&[&file.to_string_lossy()])), Some(tmp.clone()));
+        let _ = std::fs::remove_file(&file);
+        // Nothing usable: fall back to the config / home.
+        assert_eq!(dir_from_args(args(&[])), None);
+        assert_eq!(dir_from_args(args(&["/definitely/not/here"])), None);
+    }
+
+    /// Explorer's `"%V"` for a drive root arrives as `C:"`.
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_from_explorer() {
+        assert_eq!(dir_from_args(args(&["C:\""])), Some(std::path::PathBuf::from("C:\\")));
+    }
 
     #[test]
     fn passes_ascii_through() {

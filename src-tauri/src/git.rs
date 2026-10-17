@@ -1,24 +1,111 @@
 //! Read-only git queries via the git CLI (never libgit2), so the user's
 //! config, aliases and safe.directory rules apply.
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-/// Runs `git <args>` in `cwd`; returns trimmed stdout on exit code 0.
-pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0");
+/// The git executable Branchdeck uses for its own (read-only) queries.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInstall {
+    pub program: PathBuf,
+    /// e.g. "2.52.0.windows.1"
+    pub version: String,
+}
+
+fn command(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().ok()?;
+    cmd
+}
+
+fn probe(program: &Path) -> Option<GitInstall> {
+    let out = command(program).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // On macOS without the Command Line Tools, /usr/bin/git is a stub that fails here.
+    let version = text.trim().strip_prefix("git version ")?.to_string();
+    out.status.success().then(|| GitInstall { program: program.to_path_buf(), version })
+}
+
+/// Finds git once per run: PATH first, then (on Windows) the Git for Windows
+/// install folder, for installs that put only Git Bash on PATH.
+pub fn install() -> Option<&'static GitInstall> {
+    static GIT: OnceLock<Option<GitInstall>> = OnceLock::new();
+    GIT.get_or_init(|| {
+        if let Some(found) = probe(Path::new("git")) {
+            return Some(found);
+        }
+        #[cfg(windows)]
+        {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Some(bash) = crate::shell::find_git_bash() {
+                // <root>\bin\bash.exe -> <root>\cmd\git.exe
+                if let Some(root) = bash.parent().and_then(Path::parent) {
+                    candidates.push(root.join("cmd").join("git.exe"));
+                }
+            }
+            for var in ["ProgramW6432", "ProgramFiles", "LOCALAPPDATA"] {
+                if let Ok(p) = std::env::var(var) {
+                    let base = PathBuf::from(p);
+                    candidates.push(base.join("Git").join("cmd").join("git.exe"));
+                    candidates.push(base.join("Programs").join("Git").join("cmd").join("git.exe"));
+                }
+            }
+            if let Some(found) = candidates.iter().filter(|c| c.is_file()).find_map(|c| probe(c)) {
+                return Some(found);
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+/// Runs `git <args>` in `cwd`; returns trimmed stdout on exit code 0.
+/// None if git is missing or the command fails.
+pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = command(&install()?.program).args(args).current_dir(cwd).output().ok()?;
     if !out.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Like [`git`] but returns raw stdout (for `-z` output).
+pub fn git_raw(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = command(&install()?.program).args(args).current_dir(cwd).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Install hint for the current OS, shown when git is missing.
+pub fn install_hint() -> &'static str {
+    if cfg!(windows) {
+        "Install Git for Windows from https://git-scm.com/download/win, then restart Branchdeck."
+    } else if cfg!(target_os = "macos") {
+        "Run `xcode-select --install` (or install git with Homebrew), then restart Branchdeck."
+    } else {
+        "Install git with your package manager (e.g. `sudo apt install git`), then restart Branchdeck."
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInfo {
+    /// None when git can't be found.
+    install: Option<GitInstall>,
+    install_hint: &'static str,
+}
+
+#[tauri::command]
+pub async fn git_info() -> Result<GitInfo, String> {
+    Ok(GitInfo { install: install().cloned(), install_hint: install_hint() })
 }
 
 /// Facts about the repo that recipes can reference as built-in variables.
@@ -31,6 +118,63 @@ pub struct RepoContext {
     pub current_branch: Option<String>,
     pub default_branch: Option<String>,
     pub operation: Option<Operation>,
+    pub git_dir: Option<PathBuf>,
+    /// Uncommitted changes, from `git status`.
+    pub changes: Vec<ChangedFile>,
+    /// Branch patterns that need confirmation before pushing (filled in by the caller).
+    pub protected: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedFile {
+    /// Relative to the repo root, forward slashes. Untracked directories end in `/`.
+    pub path: String,
+    /// Short status, e.g. "M", "A", "D", "R", "??", "U".
+    pub code: String,
+    pub tracked: bool,
+}
+
+/// Uncommitted changes in the repo (staged, unstaged, untracked; ignored files excluded).
+pub fn changed_files(root: &Path) -> Vec<ChangedFile> {
+    let Some(out) = git_raw(root, &["--no-optional-locks", "status", "--porcelain=v2", "-z"]) else { return vec![] };
+    let mut files = vec![];
+    let mut fields = out.split(|b| *b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+    while let Some(line) = fields.next() {
+        let kind = line.chars().next();
+        match kind {
+            Some('1') | Some('2') | Some('u') => {
+                // Path is the last space-separated field (paths may contain spaces, so count fields).
+                let n = match kind {
+                    Some('1') => 8,
+                    Some('2') => 9,
+                    _ => 10,
+                };
+                let path = line.splitn(n + 1, ' ').nth(n).unwrap_or("").to_string();
+                let xy: Vec<char> = line.chars().skip(2).take(2).collect();
+                let code = if kind == Some('u') {
+                    "U".to_string()
+                } else {
+                    let c = if xy.first() != Some(&'.') { xy[0] } else { *xy.get(1).unwrap_or(&'M') };
+                    c.to_string()
+                };
+                if kind == Some('2') {
+                    fields.next(); // original path of a rename
+                }
+                files.push(ChangedFile { path, code, tracked: true });
+            }
+            Some('?') => files.push(ChangedFile { path: line[2..].to_string(), code: "??".into(), tracked: false }),
+            _ => {}
+        }
+    }
+    files
+}
+
+/// Files with unresolved conflicts.
+pub fn conflicted_files(root: &Path) -> Vec<String> {
+    git(root, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 impl RepoContext {
@@ -68,7 +212,18 @@ pub fn context(cwd: &Path) -> RepoContext {
     let current_branch = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"]).filter(|b| !b.is_empty());
     let default_branch = default_branch(&root);
     let operation = operation_in_progress(&root);
-    RepoContext { cwd: Some(cwd.to_path_buf()), root: Some(root), current_branch, default_branch, operation }
+    let git_dir = git(&root, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from);
+    let changes = changed_files(&root);
+    RepoContext {
+        cwd: Some(cwd.to_path_buf()),
+        root: Some(root),
+        current_branch,
+        default_branch,
+        operation,
+        git_dir,
+        changes,
+        protected: vec![],
+    }
 }
 
 pub fn local_branch_exists(root: &Path, name: &str) -> bool {
@@ -204,6 +359,15 @@ mod tests {
     use super::testutil::TempRepo;
     use super::*;
 
+    /// The fallback used when only Git Bash (not git.exe) is on PATH.
+    #[cfg(windows)]
+    #[test]
+    fn finds_git_next_to_git_bash() {
+        let bash = crate::shell::find_git_bash().unwrap();
+        let git_exe = bash.parent().and_then(Path::parent).unwrap().join("cmd").join("git.exe");
+        assert!(probe(&git_exe).is_some(), "{}", git_exe.display());
+    }
+
     #[test]
     fn context_in_repo() {
         let r = TempRepo::new("ctx");
@@ -212,6 +376,24 @@ mod tests {
         assert_eq!(ctx.current_branch.as_deref(), Some("feature/x"));
         assert_eq!(ctx.default_branch.as_deref(), Some("main"));
         assert!(ctx.root.is_some());
+    }
+
+    #[test]
+    fn lists_changed_files() {
+        let r = TempRepo::new("changes");
+        std::fs::write(r.work.join("README.md"), "edited\n").unwrap();
+        std::fs::write(r.work.join("new file.txt"), "x").unwrap();
+        std::fs::create_dir_all(r.work.join("dist")).unwrap();
+        std::fs::write(r.work.join("dist/app.js"), "x").unwrap();
+        std::fs::write(r.work.join("staged.txt"), "x").unwrap();
+        r.git(&["add", "staged.txt"]);
+        let mut files = changed_files(&r.work);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.code.as_str(), f.tracked)).collect();
+        assert_eq!(
+            got,
+            vec![("README.md", "M", true), ("dist/", "??", false), ("new file.txt", "??", false), ("staged.txt", "A", true)]
+        );
     }
 
     #[test]

@@ -5,8 +5,52 @@ use super::model::{Action, InputKind, Recipe};
 use super::template::{self, sh_quote, Value};
 use super::version;
 use crate::git::{self, RepoContext};
+use crate::safety::{self, Risk};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+/// Choices from the form beyond the recipe inputs.
+#[derive(Debug, Clone, Default)]
+pub struct Extras {
+    /// Files picked in the staging picker; None = not chosen yet (use suggestions).
+    pub staged: Option<Vec<String>>,
+    /// Add a `git stash` step before switching branches with uncommitted changes.
+    pub stash_first: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageFile {
+    pub path: String,
+    pub code: String,
+    /// Pre-checked in the picker.
+    pub suggested: bool,
+    /// Why it isn't suggested (e.g. "Environment file (may contain secrets)").
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Staging {
+    /// The `git add -A` step the picker controls.
+    pub step: usize,
+    pub files: Vec<StageFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirtySwitch {
+    /// The step that switches branches.
+    pub step: usize,
+    /// Uncommitted changes to tracked files.
+    pub changed: usize,
+}
+
+/// Above these, the staging step reads its file list from a file instead.
+const MAX_INLINE_FILES: usize = 30;
+const MAX_INLINE_CHARS: usize = 2000;
+const PATHSPEC_FILE: &str = "BRANCHDECK_ADD_PATHSPEC";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +76,15 @@ pub struct Plan {
     pub errors: Vec<FieldError>,
     /// Worth knowing, but not blocking.
     pub warnings: Vec<String>,
+    /// Steps that need explicit confirmation, and why.
+    pub risks: Vec<Risk>,
+    /// Set when a step switches branches while there are uncommitted changes.
+    pub dirty_switch: Option<DirtySwitch>,
+    /// The file picker for a `git add -A` before a commit.
+    pub staging: Option<Staging>,
+    /// NUL-separated pathspecs to write before running (long staging selections).
+    #[serde(skip)]
+    pub pathspec_file: Option<(PathBuf, Vec<u8>)>,
 }
 
 enum Var {
@@ -60,7 +113,13 @@ fn opt_var(v: &Option<String>, what: &str) -> Var {
     }
 }
 
+/// [`plan_with`] with no form extras.
+#[cfg(test)]
 pub fn plan(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &RepoContext) -> Plan {
+    plan_with(recipe, raw, ctx, &Extras::default())
+}
+
+pub fn plan_with(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &RepoContext, extras: &Extras) -> Plan {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut vars: HashMap<&str, Var> = HashMap::new();
@@ -202,7 +261,127 @@ pub fn plan(recipe: &Recipe, raw: &HashMap<String, serde_json::Value>, ctx: &Rep
     if used_display && errors.is_empty() {
         errors.push(error(None, "Some values are missing.".into()));
     }
-    Plan { steps, errors, warnings }
+
+    // Switching branches with uncommitted changes: reported so the form can ask;
+    // with "stash first" chosen, a visible stash step goes in front.
+    let mut dirty_switch = None;
+    let tracked_changes = ctx.changes.iter().filter(|c| c.tracked).count();
+    if tracked_changes > 0 {
+        if let Some(step) = safety::first_unstashed_switch(&steps) {
+            dirty_switch = Some(DirtySwitch { step, changed: tracked_changes });
+            if extras.stash_first {
+                let msg = format!("branchdeck: before {}", recipe.name);
+                steps.insert(0, PlannedStep { command: format!("git stash push -u -m {}", sh_quote(&msg)), always: false });
+            }
+        }
+    }
+
+    let (staging, pathspec_file) = staging(&mut steps, ctx, extras, &mut errors);
+
+    let protected: Vec<String> = if ctx.protected.is_empty() {
+        safety::DEFAULT_PROTECTED.iter().map(|s| s.to_string()).collect()
+    } else {
+        ctx.protected.clone()
+    };
+    let risks = safety::analyze(&steps, ctx.current_branch.as_deref(), &protected);
+
+    Plan { steps, errors, warnings, risks, dirty_switch, staging, pathspec_file }
+}
+
+const ADD_ALL: [&str; 4] = ["git add -A", "git add .", "git add --all", "git add -A ."];
+
+/// Why a changed file probably shouldn't be committed, if it looks like one of those.
+pub fn not_suggested_reason(path: &str) -> Option<&'static str> {
+    let trimmed = path.trim_end_matches('/');
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    let name = segments.last().copied().unwrap_or("");
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let is_template = [".example", ".sample", ".template", ".dist"].iter().any(|s| name.ends_with(s));
+    if (name == ".env" || name.starts_with(".env.")) && !is_template {
+        return Some("Environment file (may contain secrets)");
+    }
+    if ["pem", "key", "p12", "pfx", "jks", "keystore"].contains(&ext.as_str()) || name.starts_with("id_rsa") || name.starts_with("id_ed25519") {
+        return Some("Private key or certificate");
+    }
+    if segments.contains(&"node_modules") {
+        return Some("Installed dependencies");
+    }
+    if segments.iter().any(|s| ["dist", "build", "out", "target", "coverage", ".next", ".nuxt", "__pycache__"].contains(s)) {
+        return Some("Build output");
+    }
+    if name == ".DS_Store" || name == "Thumbs.db" {
+        return Some("OS metadata file");
+    }
+    if ext == "log" {
+        return Some("Log file");
+    }
+    None
+}
+
+/// A pathspec that matches exactly `path` (repo-relative), from the terminal's cwd.
+fn pathspec(path: &str, from_subdir: bool) -> String {
+    let mut magic = vec![];
+    if from_subdir {
+        magic.push("top");
+    }
+    if path.contains(['*', '?', '[', '\\']) || path.starts_with(':') {
+        magic.push("literal");
+    }
+    if magic.is_empty() {
+        path.to_string()
+    } else {
+        format!(":({}){path}", magic.join(","))
+    }
+}
+
+/// Offers the file picker for a `git add -A` that precedes a commit, and
+/// rewrites that step to add only the chosen files.
+fn staging(
+    steps: &mut [PlannedStep],
+    ctx: &RepoContext,
+    extras: &Extras,
+    errors: &mut Vec<FieldError>,
+) -> (Option<Staging>, Option<(PathBuf, Vec<u8>)>) {
+    let Some(step) = steps.iter().position(|s| ADD_ALL.contains(&s.command.trim())) else { return (None, None) };
+    let commits_later = steps[step + 1..]
+        .iter()
+        .any(|s| safety::simple_commands(&s.command).iter().any(|w| w.len() >= 2 && w[0] == "git" && w[1] == "commit"));
+    if !commits_later || ctx.changes.is_empty() {
+        return (None, None);
+    }
+
+    let files: Vec<StageFile> = ctx
+        .changes
+        .iter()
+        .map(|c| {
+            let reason = not_suggested_reason(&c.path);
+            StageFile { path: c.path.clone(), code: c.code.clone(), suggested: reason.is_none(), reason: reason.map(String::from) }
+        })
+        .collect();
+    let all: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let chosen: Vec<String> = match &extras.staged {
+        Some(sel) => sel.iter().filter(|p| all.contains(p.as_str())).cloned().collect(),
+        None => files.iter().filter(|f| f.suggested).map(|f| f.path.clone()).collect(),
+    };
+
+    let mut pathspec_file = None;
+    if chosen.is_empty() {
+        errors.push(FieldError { input: None, message: "Select at least one file to commit.".into() });
+    } else if chosen.len() < files.len() {
+        let sub = ctx.cwd_is_not_root();
+        let specs: Vec<String> = chosen.iter().map(|p| pathspec(p, sub)).collect();
+        let inline = format!("git add -- {}", specs.iter().map(|s| sh_quote(s)).collect::<Vec<_>>().join(" "));
+        steps[step].command = match &ctx.git_dir {
+            Some(dir) if specs.len() > MAX_INLINE_FILES || inline.len() > MAX_INLINE_CHARS => {
+                let file = dir.join(PATHSPEC_FILE);
+                let shown = file.to_string_lossy().replace('\\', "/");
+                pathspec_file = Some((file, specs.join("\0").into_bytes()));
+                format!("git add --pathspec-from-file={} --pathspec-file-nul", sh_quote(&shown))
+            }
+            _ => inline,
+        };
+    }
+    (Some(Staging { step, files }), pathspec_file)
 }
 
 
@@ -394,6 +573,106 @@ steps:
         assert!(cmds[0].starts_with("cd '"), "{cmds:?}");
         assert!(cmds[1].starts_with("perl ") && cmds[1].ends_with("'Cargo.toml'"));
         assert_eq!(&cmds[2..], ["git add -- 'Cargo.toml'", r#"git commit -m "chore: release v"'0.5.0' -- 'Cargo.toml'"#, r#"git tag -a "v"'0.5.0' -m "v"'0.5.0'"#]);
+    }
+
+    const COMMIT_ALL: &str = "name: c\nsteps:\n  - git add -A\n  - git commit -m x\n";
+
+    fn staged_extras(files: &[&str]) -> Extras {
+        Extras { staged: Some(files.iter().map(|s| s.to_string()).collect()), stash_first: false }
+    }
+
+    #[test]
+    fn staging_picker_suggests_and_rewrites() {
+        let repo = crate::git::testutil::TempRepo::new("stage");
+        for f in ["src.txt", ".env", ".env.example", "server.key"] {
+            std::fs::write(repo.work.join(f), "x").unwrap();
+        }
+        std::fs::create_dir_all(repo.work.join("dist")).unwrap();
+        std::fs::write(repo.work.join("dist/app.js"), "x").unwrap();
+        let r = recipe(COMMIT_ALL);
+        let c = crate::git::context(&repo.work);
+
+        // Default: risky files unchecked, the add step rewritten to the rest.
+        let p = plan(&r, &vals(&[]), &c);
+        let s = p.staging.as_ref().unwrap();
+        let unsuggested: Vec<_> = s.files.iter().filter(|f| !f.suggested).map(|f| f.path.as_str()).collect();
+        assert_eq!(unsuggested, [".env", "dist/", "server.key"]);
+        assert_eq!(p.steps[0].command, "git add -- '.env.example' 'src.txt'");
+
+        // Everything selected: keep the recipe's own `git add -A`.
+        let all = staged_extras(&["src.txt", ".env", ".env.example", "server.key", "dist/"]);
+        assert_eq!(plan_with(&r, &vals(&[]), &c, &all).steps[0].command, "git add -A");
+        // Nothing selected: can't run.
+        assert!(!plan_with(&r, &vals(&[]), &c, &staged_extras(&[])).errors.is_empty());
+        // Unknown paths are ignored, never typed.
+        let odd = plan_with(&r, &vals(&[]), &c, &staged_extras(&["src.txt", "../../etc/passwd"]));
+        assert_eq!(odd.steps[0].command, "git add -- 'src.txt'");
+    }
+
+    /// Many files from a subfolder: a pathspec file with top/literal magic that git really accepts.
+    #[test]
+    fn long_selection_uses_pathspec_file() {
+        let repo = crate::git::testutil::TempRepo::new("pathspec");
+        std::fs::create_dir_all(repo.work.join("sub")).unwrap();
+        let mut names = vec![];
+        for i in 0..40 {
+            let n = format!("f{i} [x].txt");
+            std::fs::write(repo.work.join(&n), "x").unwrap();
+            names.push(n);
+        }
+        std::fs::write(repo.work.join(".env"), "SECRET=1").unwrap();
+        let r = recipe(COMMIT_ALL);
+        let c = crate::git::context(&repo.work.join("sub"));
+        let p = plan(&r, &vals(&[]), &c);
+        assert!(p.steps[0].command.starts_with("git add --pathspec-from-file="), "{}", p.steps[0].command);
+        let (path, contents) = p.pathspec_file.clone().unwrap();
+        std::fs::write(&path, contents).unwrap();
+
+        #[cfg(windows)]
+        let bash = crate::shell::find_git_bash().unwrap();
+        #[cfg(not(windows))]
+        let bash = std::path::PathBuf::from("/bin/bash");
+        let ok = std::process::Command::new(bash)
+            .args(["--norc", "-c", &p.steps[0].command])
+            .current_dir(repo.work.join("sub"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let staged = crate::git::git(&repo.work, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(staged.lines().count(), 40);
+        assert!(!staged.contains(".env"));
+    }
+
+    #[test]
+    fn dirty_switch_warns_or_stashes_first() {
+        let repo = crate::git::testutil::TempRepo::new("dirty");
+        repo.git(&["branch", "dev"]);
+        let r = recipe("name: Go to dev\nsteps:\n  - git checkout dev\n");
+        let c = crate::git::context(&repo.work);
+        assert!(plan(&r, &vals(&[]), &c).dirty_switch.is_none(), "clean tree");
+
+        std::fs::write(repo.work.join("README.md"), "edited\n").unwrap();
+        let c = crate::git::context(&repo.work);
+        let p = plan(&r, &vals(&[]), &c);
+        assert_eq!(p.dirty_switch.as_ref().map(|d| (d.step, d.changed)), Some((0, 1)));
+
+        let p = plan_with(&r, &vals(&[]), &c, &Extras { staged: None, stash_first: true });
+        assert!(p.dirty_switch.is_some(), "still reported so the form keeps showing the choice");
+        assert_eq!(p.steps[0].command, "git stash push -u -m 'branchdeck: before Go to dev'");
+
+        // Untracked files alone don't count.
+        repo.git(&["checkout", "-q", "README.md"]);
+        std::fs::write(repo.work.join("scratch.txt"), "x").unwrap();
+        assert!(plan(&r, &vals(&[]), &crate::git::context(&repo.work)).dirty_switch.is_none());
+    }
+
+    #[test]
+    fn risks_use_the_current_branch_and_protected_list() {
+        let r = recipe("name: p\nsteps:\n  - git push\n");
+        assert_eq!(plan(&r, &vals(&[]), &RepoContext { current_branch: Some("main".into()), ..ctx() }).risks.len(), 1);
+        assert!(plan(&r, &vals(&[]), &ctx()).risks.is_empty(), "feature/a is not protected");
+        let custom = RepoContext { protected: vec!["feature/*".into()], ..ctx() };
+        assert_eq!(plan(&r, &vals(&[]), &custom).risks.len(), 1);
     }
 
     #[test]

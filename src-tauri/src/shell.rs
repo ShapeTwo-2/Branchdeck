@@ -50,12 +50,17 @@ pub fn resolve(config: &Config) -> Result<ShellSpec, String> {
     Ok(ShellSpec { args: default_args(kind, &program), program, kind, use_integration: true })
 }
 
+/// The program's name without directory or `.exe`, lowercase. Accepts both
+/// `/` and `\` as separators whatever the OS, so a configured Windows path
+/// reads the same everywhere.
+fn program_name(program: &Path) -> String {
+    let s = program.to_string_lossy();
+    let file = s.rsplit(['/', '\\']).next().unwrap_or(&s).to_lowercase();
+    file.strip_suffix(".exe").map(String::from).unwrap_or(file)
+}
+
 fn kind_of(program: &Path) -> Kind {
-    let name = program
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
+    match program_name(program).as_str() {
         "bash" => Kind::Bash,
         "zsh" => Kind::Zsh,
         _ => Kind::Other,
@@ -68,7 +73,7 @@ fn default_args(kind: Kind, program: &Path) -> Vec<String> {
         Kind::Bash => vec!["--login".into(), "-i".into()],
         Kind::Zsh => vec!["-l".into(), "-i".into()],
         Kind::Other => {
-            let name = program.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let name = program_name(program);
             match name.as_str() {
                 "fish" => vec!["-l".into(), "-i".into()],
                 "pwsh" | "powershell" => vec!["-NoLogo".into()],

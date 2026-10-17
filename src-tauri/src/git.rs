@@ -187,10 +187,16 @@ impl RepoContext {
     }
 }
 
-/// Compares paths from different sources (git prints C:/x, the shell may print C:\x).
+/// Compares paths from different sources. They can name the same folder in
+/// different ways: C:/x vs C:\x, a symlink vs its target (macOS /var vs
+/// /private/var), or a Windows 8.3 short name (RUNNER~1) vs the long one.
+/// So both are resolved to their real location first.
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| {
-        let s = p.to_string_lossy().replace('\\', "/");
+        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = real.to_string_lossy().replace('\\', "/");
+        // canonicalize on Windows returns the \\?\C:\... form.
+        let s = s.strip_prefix("//?/").unwrap_or(&s);
         let s = s.trim_end_matches('/').to_string();
         if cfg!(windows) {
             s.to_lowercase()
@@ -376,6 +382,30 @@ mod tests {
         assert_eq!(ctx.current_branch.as_deref(), Some("feature/x"));
         assert_eq!(ctx.default_branch.as_deref(), Some("main"));
         assert!(ctx.root.is_some());
+    }
+
+    #[test]
+    fn same_path_sees_through_spelling_differences() {
+        let r = TempRepo::new("samepath");
+        let root = repo_root(&r.work).unwrap();
+        // git's spelling vs the temp dir's (symlinked on macOS, 8.3 names on Windows CI).
+        assert!(same_path(&r.work, &root), "{} vs {}", r.work.display(), root.display());
+        assert!(same_path(&r.work, Path::new(&format!("{}/", r.work.display()))));
+        std::fs::create_dir_all(r.work.join("sub")).unwrap();
+        assert!(!same_path(&r.work.join("sub"), &root));
+        assert!(!context(&r.work).cwd_is_not_root());
+        assert!(context(&r.work.join("sub")).cwd_is_not_root());
+    }
+
+    /// The macOS case, reproduced anywhere symlinks work.
+    #[cfg(unix)]
+    #[test]
+    fn same_path_through_a_symlink() {
+        let r = TempRepo::new("symlink");
+        let link = r.base.join("link");
+        std::os::unix::fs::symlink(&r.work, &link).unwrap();
+        assert!(same_path(&link, &r.work));
+        assert!(!context(&link).cwd_is_not_root());
     }
 
     #[test]
